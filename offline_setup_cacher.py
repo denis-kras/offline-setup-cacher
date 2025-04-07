@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+VERSION: str = '1.0.0'
+# initial release
+
+
 import os
 import ssl
 import subprocess
@@ -108,6 +112,12 @@ def update_global_variables(
 
 
 def create_ca_certificates():
+    """
+    Function creates a self-signed CA PEM certificate and private key.
+
+    :return:
+    """
+
     # Generate a 2048-bit RSA private key
     private_key = rsa.generate_private_key(
         public_exponent=65537,
@@ -144,7 +154,14 @@ def create_ca_certificates():
         )
         pem_file.write(certificate.public_bytes(serialization.Encoding.PEM))
 
+
 def create_crt_and_der_from_pem():
+    """
+    Function creates DER and CRT files from the PEM file.
+    The PEM file is expected to contain multiple PEM objects.
+    The function extracts the first certificate block and writes it to squidCA.der and squidCA.crt files.
+    :return:
+    """
     def extract_certificate_from_pem(pem_file_data: bytes) -> bytes:
         """
         Extracts the first certificate block from a PEM file that contains multiple PEM objects.
