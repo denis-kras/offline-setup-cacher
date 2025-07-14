@@ -27,7 +27,7 @@ Since docker registry can't be cached through HTTP directly because of its natur
 https://github.com/rpardini/docker-registry-proxy
 
 ## Installation and Execution
-### Ubuntu Server
+### Ubuntu Server (Desktop version that will act as a server)
 Note: all the commands below are to run in the terminal.
 1. Set the file as executable:
     ```bash
@@ -68,3 +68,18 @@ Note: the client scripts are `client_install.sh`, `client_uninstall.sh` and the 
     ```bash
     ./client_uninstall.sh
     ```
+   
+### Proxy Server Offline Installation
+There is an option to install the proxy server without internet connection.
+1. On the Ubuntu host with internet connection, run the script with the '-oppre' or '--offline_prepare_prerequisites' option:
+    ```bash
+    sudo ./offline_setup_cacher.py -oppre
+    ```
+   This will create a zip with all the necessary files to install the proxy server on Ubuntu host without internet connection.
+
+2. Copy the zip file and the 'offline_setup_cacher.py' to the Ubuntu host without internet connection.
+3. On the Ubuntu host without internet connection, run the script with the '-oipre' or '--offline_install_prerequisites' option:
+    ```bash
+    sudo ./offline_setup_cacher.py -oipre
+    ```
+   This will install all the necessary packages and set up the proxy server.

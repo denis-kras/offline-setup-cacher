@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-VERSION: str = '1.0.0'
-# initial release
+VERSION: str = '1.1.0'
+# added offline preparation and installation
 
 
 import os
@@ -22,6 +22,8 @@ import shlex
 import shutil
 import socket
 import time
+import tempfile
+import textwrap
 
 # noinspection PyPackageRequirements
 from cryptography import x509
@@ -69,6 +71,11 @@ ENABLE_FULL_LOG: bool = True
 FULL_LOG_REQUEST_RESPONSE_TRUNCATION_LIMIT: int = 300
 
 DOCKER_READY_EVENT = threading.Event()
+
+GET_DOCKER_URL: str = "https://get.docker.com"
+
+PREPARATION_OUTPUT_DIR: str = str(Path(__file__).parent / "proxy-offline-bundle")
+PREPARATION_OUTPUT_ZIP: str = f"{PREPARATION_OUTPUT_DIR}.zip"
 
 
 def update_global_variables(
@@ -811,6 +818,257 @@ def install_docker():
     subprocess.run("curl -fsSL https://get.docker.com | sh", shell=True, check=True)
 
 
+def prepare_offline_prerequisites():
+    # The Bash script in a single triple-quoted string - this is to easier copy-paste it if needed to run directly.
+    bash_script = textwrap.dedent(r"""#!/usr/bin/env bash
+#
+# Build an offline-install bundle for Docker Engine on Ubuntu 24.04 LTS.
+# The package list is auto-discovered from `get.docker.com --dry-run`.
+#
+#   sudo ./prepare_docker_offline.sh  [/path/to/output_dir]
+#
+set -Eeuo pipefail
+
+################################################################################
+# CLI PARAMETERS
+#   $1  → OUTDIR           (already supported: where to build the bundle)
+#   $2  → GET_DOCKER_URL   (defaults to https://get.docker.com)
+#   $3  → PROXY_IMAGE      (defaults to rpardini/docker-registry-proxy:0.6.5)
+#   $4  → OUTPUT_ZIP       (defaults to "$OUTDIR.zip")
+################################################################################
+OUTDIR="${1:-"$PWD/proxy-offline-bundle"}"
+GET_DOCKER_URL="${2:-https://get.docker.com}"
+PROXY_IMAGE="${3:-rpardini/docker-registry-proxy:0.6.5}"
+OUTPUT_ZIP="${4:-$OUTDIR.zip}"
+ARCHIVE="$OUTDIR/registry-proxy-image.tar.gz"
+
+die()       { echo "ERROR: $*" >&2; exit 1; }
+need_root() { [[ $EUID -eq 0 ]] || die "Run as root (use sudo)"; }
+need_cmd() {
+  local cmd=$1
+  local pkg=${2:-$1}               # default package == command
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "[*] $cmd not found – installing $pkg ..."
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive \
+      apt-get install -y --no-install-recommends "$pkg" || \
+      die "Unable to install required package: $pkg"
+  fi
+}
+
+need_root
+need_cmd curl                 # binary and pkg are both “curl”
+need_cmd gpg                  # → apt-get install gpg
+need_cmd dpkg-scanpackages dpkg-dev   # pkg name differs
+
+echo "[*] Install Docker before preparing the offline bundle."
+curl -fsSL "$GET_DOCKER_URL" | sh
+
+mkdir -p "$OUTDIR"/packages
+echo "[*] Output directory: $OUTDIR"
+
+echo "[*] Discovering package list via get.docker.com --dry-run ..."
+DRY_LOG=$(curl -fsSL "$GET_DOCKER_URL" | bash -s -- --dry-run)
+
+echo "[*] Determining package list via --dry-run ..."
+PKGS=$(printf '%s\n' "$DRY_LOG" | sed -n 's/.* install \(.*\) >\/dev\/null.*/\1/p')
+
+if ! grep -q '\S' <<< "$PKGS"; then
+  echo "No packages detected in dry-run output – aborting." >&2
+  exit 1
+fi
+
+echo "Packages to install:"
+echo "$PKGS"
+
+echo "[*] Downloading packages and all dependencies …"
+apt-get update -qq
+apt-get clean
+mkdir -p /var/cache/apt/archives/partial
+apt-get -y --download-only --reinstall install $PKGS
+cp -v /var/cache/apt/archives/*.deb "$OUTDIR/packages/"
+echo "[*] $(ls "$OUTDIR/packages" | wc -l) .deb files written to packages/"
+
+echo "[*] Building local Packages.gz index …"
+pushd "$OUTDIR/packages" >/dev/null
+for deb in *.deb; do
+  dpkg-deb -f "$deb" Package
+done | awk '{printf "%s\tmisc\toptional\n",$1}' > override
+dpkg-scanpackages . override | tee Packages | gzip -9c > Packages.gz
+popd >/dev/null
+
+
+echo ">> Checking for Docker ..."
+command -v docker >/dev/null 2>&1 || { echo "Docker not found."; exit 1; }
+
+echo ">> Pulling $PROXY_IMAGE ..."
+docker pull --platform linux/amd64 "$PROXY_IMAGE"
+
+echo ">> Saving image to $ARCHIVE ..."
+docker save "$PROXY_IMAGE" | gzip > "$ARCHIVE"
+
+echo
+echo "Bundle ready:"
+du -h "$ARCHIVE"
+echo
+
+# Pack final bundle
+echo "[*] Creating a zip archive ..."
+parent_dir=$(dirname  "$OUTDIR")
+base_name=$(basename "$OUTDIR")
+
+# Create new shell, cd into the directory, and zip the contents. So that the zip file will not contain the full path.
+(
+  cd "$parent_dir"
+  zip -rq "$OUTPUT_ZIP" "$base_name"
+)
+
+rm -rf "$OUTDIR"
+echo "[✓] Docker offline bundle created at $OUTPUT_ZIP"
+echo
+echo "Copy the zip file and this python script to the target machine. Execute with: sudo offline_setup_cacher.py --oipre"
+    """)
+
+    # Write it to a secure temporary file.
+    with tempfile.NamedTemporaryFile('w', delete=False, suffix='.sh') as f:
+        f.write(bash_script)
+        temp_path = f.name
+    os.chmod(temp_path, 0o755)  # make it executable
+
+    cmd = [
+        "sudo", "bash", temp_path,  # script path
+        PREPARATION_OUTPUT_DIR,  # $1  OUTDIR
+        GET_DOCKER_URL,  # $2  GET_DOCKER_URL
+        DOCKER_PROXY_IMAGE_NAME,  # $3  PROXY_IMAGE
+        PREPARATION_OUTPUT_ZIP,  # $4  OUTPUT_ZIP
+    ]
+
+    # Run it and stream output live.
+    try:
+        subprocess.run(cmd, check=True)
+    finally:
+        # 5. Clean up the temp file unless you want to inspect it.
+        os.remove(temp_path)
+
+
+def install_offline_prerequisites():
+    bash_script = textwrap.dedent(r"""#!/usr/bin/env bash
+# Offline installer for the Docker bundle produced by prepare_docker_offline.sh
+set -euo pipefail
+
+die()       { echo "ERROR: $*" >&2; exit 1; }
+need_root() { [[ $EUID -eq 0 ]] || die "Run as root (use sudo)"; }
+
+need_root
+
+# ------------------------------------------------------------------------------
+# Paths
+# ------------------------------------------------------------------------------
+BUNDLE_ZIP="${1:-"$PWD/proxy-offline-bundle.zip"}"
+
+BUNDLE_DIR="${BUNDLE_ZIP%.zip}"  # remove .zip suffix
+REPO_DIR="$BUNDLE_DIR/packages"                        # contains *.deb + Packages
+OFFLINE_LIST="/etc/apt/sources.list.d/docker-offline.list"
+ARCHIVE="$BUNDLE_DIR/registry-proxy-image.tar.gz"
+
+# Extract zip archive if it exists
+if [[ -f "$BUNDLE_ZIP" ]]; then
+  echo "[*] Extracting offline bundle from $BUNDLE_ZIP ..."
+  mkdir -p "$BUNDLE_DIR"
+  unzip -q "$BUNDLE_ZIP" -d "."
+else
+  die "Bundle zip file '$BUNDLE_ZIP' not found. Provide a valid path."
+fi
+
+TEMP_PARTS="$(mktemp -d)"                              # empty dir ⇒ no extra lists
+
+# ------------------------------------------------------------------------------
+# Helper to clean up even if the script aborts
+# ------------------------------------------------------------------------------
+cleanup() {
+  sudo rm -f "$OFFLINE_LIST"
+  sudo rm -rf "$TEMP_PARTS"
+}
+trap cleanup EXIT
+
+# ------------------------------------------------------------------------------
+# 1. Add the local repository (trusted) as the *only* source we will use
+# ------------------------------------------------------------------------------
+echo "[*] Adding temporary APT source for the offline bundle …"
+echo "deb [trusted=yes] file:$REPO_DIR ./" | sudo tee "$OFFLINE_LIST" >/dev/null
+
+# Ensure plain index exists (APT always understands the un-compressed form)
+if [[ ! -f "$REPO_DIR/Packages" && -f "$REPO_DIR/Packages.gz" ]]; then
+    gunzip -c "$REPO_DIR/Packages.gz" > "$REPO_DIR/Packages"
+fi
+
+# ------------------------------------------------------------------------------
+# 2. Update metadata – but ONLY from our offline list
+# ------------------------------------------------------------------------------
+echo "[*] Updating APT metadata – offline only …"
+sudo apt-get -o Dir::Etc::sourcelist="$OFFLINE_LIST" \
+             -o Dir::Etc::sourceparts="$TEMP_PARTS" \
+             -o APT::Get::List-Cleanup="0" \
+             update -qq
+
+# ------------------------------------------------------------------------------
+# 3. Figure out which packages are inside the bundle
+# ------------------------------------------------------------------------------
+PKGS=$(awk '/^Package: /{print $2}' "$REPO_DIR/Packages")
+
+echo "[*] Installing:"
+printf '    • %s\n' $PKGS
+
+# ------------------------------------------------------------------------------
+# 4. Install them, again restricting APT to the offline repo only
+# ------------------------------------------------------------------------------
+sudo apt-get -y \
+     -o Dir::Etc::sourcelist="$OFFLINE_LIST" \
+     -o Dir::Etc::sourceparts="$TEMP_PARTS" \
+     install $PKGS
+
+echo "[✓] Docker installed completely offline!"
+
+usage() {
+  echo "Usage: $0 <image-archive.tar.gz>"
+  exit 1
+}
+
+[[ -f "$ARCHIVE" ]] || { echo "Archive '$ARCHIVE' not found."; usage; }
+
+echo ">> Checking for Docker ..."
+command -v docker >/dev/null 2>&1 || {
+  echo "Docker is not installed; install Docker and try again."
+  exit 1
+}
+
+echo ">> Loading image from $ARCHIVE ..."
+gunzip -c "$ARCHIVE" | sudo docker load
+
+echo "Image loaded successfully."
+echo "Removing extracted files..."
+rm -rf "$BUNDLE_DIR"
+    """)
+
+    # Write it to a secure temporary file.
+    with tempfile.NamedTemporaryFile('w', delete=False, suffix='.sh') as f:
+        f.write(bash_script)
+        temp_path = f.name
+    os.chmod(temp_path, 0o755)  # make it executable
+
+    cmd = [
+        "sudo", "bash", temp_path,
+        PREPARATION_OUTPUT_ZIP,  # $1  BUNDLE_ZIP
+    ]
+
+    # 4. Run it and stream output live.
+    try:
+        subprocess.run(cmd, check=True)
+    finally:
+        # 5. Clean up the temp file unless you want to inspect it.
+        os.remove(temp_path)
+
+
 def get_server_ip():
     """
     Determine the server's IP address (non-loopback).
@@ -940,29 +1198,56 @@ def create_client_installation_files(
 
 
 def run_servers_main(
-        disable_cache_server: bool,
-        disable_docker_cache: bool,
-        ca_cert_file: str,
-        cache_dir: str,
-        certs_dir: str,
-        server_cache_port: int,
-        docker_cache_port: int,
-        install_prerequisites: bool,
-        client_files_dir: str
+        disable_cache_server: bool = False,
+        disable_docker_cache: bool = False,
+        ca_cert_file: str = None,
+        cache_dir: str = None,
+        certs_dir: str = None,
+        server_cache_port: int = None,
+        docker_cache_port: int = None,
+        client_files_dir: str = None,
+        install_prerequisites: bool = False,
+        offline_prepare_prerequisites: bool = False,
+        offline_install_prerequisites: bool = False
 ):
+    if cache_dir is None:
+        cache_dir = CACHE_DIRECTORY
+    if certs_dir is None:
+        certs_dir = CERTS_DIRECTORY
+    if server_cache_port is None:
+        server_cache_port = CACHE_SERVER_PROXY_PORT
+    if docker_cache_port is None:
+        docker_cache_port = DOCKER_CACHE_REGISTRY_PORT
+
+    if (install_prerequisites + offline_install_prerequisites + offline_prepare_prerequisites) > 1:
+        print("You can only use one of the options: --install_prerequisites, --offline_prepare_prerequisites, "
+              "--offline_install_prerequisites. Exiting...")
+        return 1
+
+    if not offline_prepare_prerequisites and not offline_install_prerequisites:
+        if disable_cache_server and disable_docker_cache:
+            print("Both cache server and docker cache are disabled. Exiting...")
+            return 1
+
+        if not disable_docker_cache and not is_docker_installed() and not install_prerequisites:
+                print("Docker is not installed. Please install Docker to use the docker cache feature.\n"
+                      "Run this script with the [--install_prerequisites] option to install Docker.")
+                return 1
 
     if not is_admin():
         print("This script must be run with sudo.")
         return 1
 
-    if disable_cache_server and disable_docker_cache:
-        print("Both cache server and docker cache are disabled. Exiting...")
-        return 1
+    if offline_prepare_prerequisites:
+        print(
+            "Selected [--offline_prepare_prerequisites], the other arguments are omitted. Preparing prerequisites for offline installation...")
+        prepare_offline_prerequisites()
+        return 0
 
-    if not disable_docker_cache and not is_docker_installed() and not install_prerequisites:
-            print("Docker is not installed. Please install Docker to use the docker cache feature.\n"
-                  "Run this script with the [--install_prerequisites] option to install Docker.")
-            return 1
+    if offline_install_prerequisites:
+        print("Selected [--offline_install_prerequisites], the other arguments are omitted. Installing prerequisites from the prepared archive file...")
+        install_offline_prerequisites()
+        return 0
 
     os.makedirs(CACHE_DIRECTORY, exist_ok=True)
     os.makedirs(CERTS_DIRECTORY, exist_ok=True)
@@ -1016,21 +1301,26 @@ def parse_args():
                         help="Disable the cache server on execution")
     parser.add_argument('-ddc', '--disable_docker_cache', action='store_true',
                         help="Disable docker cache.")
-    parser.add_argument('--ca_cert', type=str, default=None,
+    parser.add_argument('--ca_cert', type=str,
                         help="Full path to CA certificate file that will contain the private key. "
                              "Default: <working directory>/certs/server_ca/cache_ca.pem. If non-existent it will be created.")
-    parser.add_argument('--cache_dir', type=str, default=CACHE_DIRECTORY,
+    parser.add_argument('--cache_dir', type=str,
                         help="Full path to cache directory. Default: <working directory>/cache")
-    parser.add_argument('--certs_dir', type=str, default=CERTS_DIRECTORY,
+    parser.add_argument('--certs_dir', type=str,
                         help="Full path to certificates directory. Default: <working directory>/certs")
-    parser.add_argument('-sc_port', '--server_cache_port', type=int, default=CACHE_SERVER_PROXY_PORT,
+    parser.add_argument('-sc_port', '--server_cache_port', type=int,
                         help="Server cache port. Default: 3129")
-    parser.add_argument('-dc_port', '--docker_cache_port', type=int, default=DOCKER_CACHE_REGISTRY_PORT,
+    parser.add_argument('-dc_port', '--docker_cache_port', type=int,
                         help="Docker local registry cache port. Default: 3128. Caution: 3128 works out of the box with docker registry proxy image")
+    parser.add_argument('-ccs', '--create_ubuntu_client_setting_script', type=str,
+                        help="Full path to directory where ubuntu client installation bash scripts and required files will be stored. Default: <working directory>/client_files")
     parser.add_argument('-ipre', '--install_prerequisites', action='store_true',
                         help="Install prerequisites for the server to run.")
-    parser.add_argument('-ccs', '--create_ubuntu_client_setting_script', type=str, default=None,
-                        help="Full path to directory where ubuntu client installation bash scripts and required files will be stored. Default: <working directory>/client_files")
+    parser.add_argument('-oppre', '--offline_prepare_prerequisites', action='store_true',
+                        help="Prepare an archive file on the online computer of everything that is needed to be installed on the offline computer.")
+    parser.add_argument('-oipre', '--offline_install_prerequisites', action='store_true',
+                    help="Install the prepared archive file on the offline computer.")
+
     return parser.parse_args()
 
 
@@ -1046,8 +1336,10 @@ if __name__ == '__main__':
             exec_args.certs_dir,
             exec_args.server_cache_port,
             exec_args.docker_cache_port,
+            exec_args.create_ubuntu_client_setting_script,
             exec_args.install_prerequisites,
-            exec_args.create_ubuntu_client_setting_script
+            exec_args.offline_prepare_prerequisites,
+            exec_args.offline_install_prerequisites
         )
     except KeyboardInterrupt:
         print("Exiting...")
