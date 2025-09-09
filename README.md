@@ -14,33 +14,32 @@ The server was tested with Ubuntu 24.04 LTS and python 3.12.
 The client software that was tested:
 - apt
 - pip
-- docker
+- python requests
+- docker, docker BuildKit
 - curl, wget (downloading files from urls directly, repos from github.com are supported + 302 requests)
+- npm
+- sudoers
 
 Probably it will work with anything HTTP/HTTPS related, but I haven't tested it with other software or methods.
 
 ## Requirements
-You don't need anything special to install this script on the server, the setup process will do everything for you. You do need Ubuntu 24.04 LTS and Python 3.12 installed to run the server cache script.
+You don't need anything special to install this script on the server. You do need Ubuntu 24.04 LTS, and it was tested with Python 3.12.
 
-## 3rd Party Software
-Since docker registry can't be cached through HTTP directly because of its nature, we could use the official solution for local docker registry. The problem with that, I didn't find a way in the documentation to cache the manifest files for offline usage. Because of that this script uses custom-made solution:
-https://github.com/rpardini/docker-registry-proxy
-
-## Installation and Execution
+## Execution
 ### Ubuntu Server (Desktop version that will act as a server)
 Note: all the commands below are to run in the terminal.
 1. Set the file as executable:
     ```bash
     chmod +x offline_setup_cacher.sh
     ```
-2. First run the script with prerequisites installation:
+2. Run the script:
     ```bash
-    ./offline_setup_cacher.sh --install_prerequisites
+    ./offline_setup_cacher.py
     ```
 3. You can also run the script with `--help` to see all the options available.
-4. By default, the client install/uninstall scripts will be created in the `./client_scripts` directory. You can change this by using the `-ccs /your/client/files/path` option.
-Note: the client scripts are `client_install.sh`, `client_uninstall.sh` and the CA certificate files.
-`client_install.sh` will install the CA certificate, set caching server IP as the proxy for the system, and the same IP for the separate docker proxy.
+4. By default, the client install/uninstall scripts will be created in the `./client_scripts` directory. You can change this by using the `-cfd /your/client/files/path` option.
+Note: the client scripts are `client_install.sh`, `client_uninstall.sh` and the CA certificate file.
+`client_install.sh` will install the CA certificate, set caching server IP as the proxy for the system.
 
 ### Ubuntu Client
 1. Get the files from the server in the `./client_scripts` directory and copy them to the client machine.
@@ -54,11 +53,11 @@ Note: the client scripts are `client_install.sh`, `client_uninstall.sh` and the 
     ```
    If you want the proxy to be available also in the same terminal session right awaym you can execute the command with `source`:
     ```bash
-    source ./client_install.sh
+    source client_install.sh
     ```
    or
     ```bash
-    . ./client_install.sh
+    . client_install.sh
     ```
    For the `source` command to work you don't need to set the file as executable.
 4. If you want to remove all the changes that `client_install.sh` made and remove the custom CA certificates, you can run the `client_uninstall.sh` script:
@@ -68,18 +67,3 @@ Note: the client scripts are `client_install.sh`, `client_uninstall.sh` and the 
     ```bash
     ./client_uninstall.sh
     ```
-   
-### Proxy Server Offline Installation
-There is an option to install the proxy server without internet connection.
-1. On the Ubuntu host with internet connection, run the script with the '-oppre' or '--offline_prepare_prerequisites' option:
-    ```bash
-    sudo ./offline_setup_cacher.py -oppre
-    ```
-   This will create a zip with all the necessary files to install the proxy server on Ubuntu host without internet connection.
-
-2. Copy the zip file and the 'offline_setup_cacher.py' to the Ubuntu host without internet connection.
-3. On the Ubuntu host without internet connection, run the script with the '-oipre' or '--offline_install_prerequisites' option:
-    ```bash
-    sudo ./offline_setup_cacher.py -oipre
-    ```
-   This will install all the necessary packages and set up the proxy server.
