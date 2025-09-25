@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-VERSION: str = '2.0.0'
-# Exchanged the docker cache container to local code + Full rewrite.
+VERSION: str = '2.0.1'
+# SIGINT fix.
 
 
 import os
@@ -26,6 +26,7 @@ import ipaddress
 import textwrap
 import shlex
 from dataclasses import dataclass
+import signal
 
 import psutil
 from cryptography import x509
@@ -158,7 +159,13 @@ def update_global_variables(
         CLIENT_INSTALLATION_FILES_DIRECTORY = client_files_dir
 
 
-def remove_dummy_interface():
+def _graceful_shutdown(signum, frame):
+    _exit_clean()
+
+
+def _exit_clean():
+    print("Exiting...")
+
     if DUMMY_INTERFACE_CREATED:
         print("[+] Removing dummy interface...")
         subprocess.check_call(shlex.split("sudo rm -f /etc/systemd/network/10-proxy.netdev /etc/systemd/network/20-proxy.network"))
@@ -176,6 +183,8 @@ def remove_dummy_interface():
     if GO_OFFLINE:
         subprocess.check_call(shlex.split("sudo ip route del blackhole default"))
         print("[+] Connectivity restored.")
+
+    sys.exit(0)
 
 
 def _run_and_stream(
@@ -1799,14 +1808,15 @@ def _make_arg_parser():
 
 
 if __name__ == '__main__':
+    signal.signal(signal.SIGINT, _graceful_shutdown)
     arg_parser = _make_arg_parser()
     exec_args = arg_parser.parse_args()
 
     try:
         exit_result: int = run_servers_main(**vars(exec_args))
     except KeyboardInterrupt:
-        print("Exiting...")
-        remove_dummy_interface()
+        _exit_clean()
+    finally:
         exit_result = 0
 
     sys.exit(exit_result)
