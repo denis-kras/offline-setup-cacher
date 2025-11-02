@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-VERSION: str = '2.0.1'
-# SIGINT fix.
+VERSION: str = '2.0.2'
+# fixed rsync depend.
 
 
 import os
@@ -1222,7 +1222,22 @@ real="$(find_real_docker)"
 if [[ $1 == build ]]; then
   ctx="${{@: -1}}"; [[ $ctx == -* ]] && ctx="."
   tmp=$(mktemp -d)
-  rsync -a --delete "$ctx"/ "$tmp"/
+  
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a --delete "$ctx"/ "$tmp"/
+  else
+    # fallback: copy everything, keeping dotfiles
+    (shopt -s dotglob; cp -a "$ctx"/* "$tmp"/ 2>/dev/null || true)
+    ( [ -f "$ctx/Dockerfile" ] && cp -a "$ctx/Dockerfile" "$tmp"/ ) || true
+  fi
+    
+  # ensure there is a Dockerfile
+  if [ ! -s "$tmp/Dockerfile" ]; then
+    echo "ERROR: Dockerfile not found in context: $ctx" >&2
+    rm -rf "$tmp"
+    exit 2
+  fi
+  
   cp {crt_ca_shared_target_path} "$tmp"/{crt_ca_file_name}
 
   cat >"$tmp"/.patch <<'PATCH'
