@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-VERSION: str = '2.0.2'
-# fixed rsync depend.
+VERSION: str = '2.1.0'
+# added apt countries ignore.
 
 
 import os
@@ -444,6 +444,25 @@ def _serve_offline_token(handler):
     handler.wfile.write(body)
 
 
+def _canonicalize_ubuntu_netloc(netloc: str) -> str:
+    """
+    Make country-specific Ubuntu mirrors equivalent to canonical hosts.
+    Examples:
+      de.archive.ubuntu.com  -> archive.ubuntu.com
+      fr.security.ubuntu.com -> security.ubuntu.com
+    Keep explicit ports if present.
+    """
+    host, sep, port = netloc.partition(':')
+    parts = host.lower().split('.')
+    # match *.archive.ubuntu.com
+    if len(parts) >= 4 and parts[-3:] == ['archive', 'ubuntu', 'com']:
+        host = 'archive.ubuntu.com'
+    # match *.security.ubuntu.com
+    elif len(parts) >= 4 and parts[-3:] == ['security', 'ubuntu', 'com']:
+        host = 'security.ubuntu.com'
+    return host + (sep + port if sep else '')
+
+
 def generate_cache_key(
         method: str,
         url: str,
@@ -457,8 +476,10 @@ def generate_cache_key(
 
     parsed = urlparse(url)
 
+    canon_netloc = _canonicalize_ubuntu_netloc(parsed.netloc)
+
     # Build the canonical part common to all requests.
-    normalized = parsed.netloc + parsed.path
+    normalized = canon_netloc + parsed.path
 
     # For everything that isn’t a registry-manifest keep the query
     if parsed.query:
