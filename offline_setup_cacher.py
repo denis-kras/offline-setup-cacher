@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-VERSION: str = '2.1.1'
-# fix for ubuntu multilocation.
+VERSION: str = '2.0.2'
+# fixed rsync depend.
 
 
 import os
@@ -444,32 +444,6 @@ def _serve_offline_token(handler):
     handler.wfile.write(body)
 
 
-def _canonicalize_ubuntu_netloc(netloc: str) -> str:
-    """
-    Treat country/edge mirrors as the canonical host for cache keys.
-    Keeps the port if present (e.g., ':80', ':443').
-    """
-    host, sep, port = netloc.partition(':')
-    parts = host.lower().split('.')
-
-    # *.security.ubuntu.com  -> security.ubuntu.com
-    if len(parts) >= 4 and parts[-3:] == ['security', 'ubuntu', 'com']:
-        host = 'security.ubuntu.com'
-
-    # *.archive.ubuntu.com   -> archive.ubuntu.com
-    elif len(parts) >= 4 and parts[-3:] == ['archive', 'ubuntu', 'com']:
-        host = 'archive.ubuntu.com'
-
-    return host + (sep + port if sep else '')
-
-def _canonicalize_url(url: str) -> str:
-    p = urlparse(url)
-    canon_netloc = _canonicalize_ubuntu_netloc(p.netloc)
-    if canon_netloc == p.netloc:
-        return url
-    return urlunparse((p.scheme, canon_netloc, p.path, p.params, p.query, p.fragment))
-
-
 def generate_cache_key(
         method: str,
         url: str,
@@ -481,15 +455,14 @@ def generate_cache_key(
     :param url: string, the url to generate the key for.
     """
 
-    url_for_key = _canonicalize_url(url)
-    p = urlparse(url_for_key)
+    parsed = urlparse(url)
 
-    # Key = METHOD + canonical netloc + path + query
-    normalized = p.netloc + p.path + (('?' + p.query) if p.query else '')
+    # Build the canonical part common to all requests.
+    normalized = parsed.netloc + parsed.path
 
-    # # For everything that isn’t a registry-manifest keep the query
-    # if parsed.query:
-    #     normalized += "?" + parsed.query
+    # For everything that isn’t a registry-manifest keep the query
+    if parsed.query:
+        normalized += "?" + parsed.query
 
     # Prepend the HTTP method and (optionally) Accept header,
     # so HEAD ≠ GET and OCI ≠ Docker schema                          #
