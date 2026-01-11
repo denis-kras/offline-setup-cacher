@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-VERSION: str = '2.0.2'
-# fixed rsync depend.
+VERSION: str = '2.1.0'
+# client scripts improvements, specific codes caching, offline mode fix.
 
 
 import os
@@ -17,7 +17,7 @@ import http.client
 import pickle
 import csv
 import hashlib
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qsl, urlencode
 import shutil
 import socket
 import time
@@ -27,6 +27,7 @@ import textwrap
 import shlex
 from dataclasses import dataclass
 import signal
+import traceback
 
 import psutil
 from cryptography import x509
@@ -38,6 +39,9 @@ from rich.console import Console
 
 
 console = Console()
+
+
+_BLOB_DIGEST_RE = re.compile(r"/blobs/sha256:[0-9a-f]{64}$")
 
 
 SCRIPT_DIRECTORY: str = os.path.dirname(os.path.realpath(__file__))
@@ -54,6 +58,12 @@ CERTIFICATES_SHARE_DIRECTORY: str = '/usr/local/share/ca-certificates'
 CLIENT_INSTALL_FILE_NAME: str = 'client_install.sh'
 CLIENT_UNINSTALL_FILE_NAME: str = 'client_uninstall.sh'
 
+CLIENT_APT_BUNDLE_CREATE_FILE_NAME: str = 'create_apt_bundle.sh'
+CLIENT_APT_BUNDLE_INSTALL_FILE_NAME: str = 'install_apt_bundle.sh'
+APT_BUNDLE_ARCHIVE_NAME: str = 'apt-localrepo.tar.gz'
+APT_BUNDLE_CACHE_DIRECTORY: str = str(Path(SCRIPT_DIRECTORY, 'cache_apt'))
+APT_BUNDLE_DEFAULT_ARCHIVE_PATH: str = str(Path(APT_BUNDLE_CACHE_DIRECTORY, APT_BUNDLE_ARCHIVE_NAME))
+
 LOGS_DIRECTORY: str = str(Path(SCRIPT_DIRECTORY, 'logs'))
 
 REQUESTS_CSV_PATH: str = str(Path(LOGS_DIRECTORY, 'requests_log.csv'))
@@ -69,6 +79,7 @@ FULL_LOG_REQUEST_RESPONSE_TRUNCATION_LIMIT: int = 300
 DUMMY_INTERFACE_CREATED: bool = False
 GO_OFFLINE: bool = False
 
+DEBUG = True
 
 CLIENT_SCRIPT_DEFAULT_FLAGS: dict = {
     'h': 'Set HTTP/HTTPS proxy environment variables',
@@ -109,6 +120,7 @@ class NoInterfacesFoundError(Exception):
     """
     Exception raised when no network interfaces are found.
     """
+
     def __init__(self, message: str = "No network interfaces found."):
         super().__init__(message)
 
@@ -117,12 +129,22 @@ class MoreThanOneInterfaceFoundError(Exception):
     """
     Exception raised when more than one network interface is found.
     """
+
     def __init__(self, message: str = "More than one network interface found."):
         super().__init__(message)
 
 
 class InterfaceArgumentsError(Exception):
     pass
+
+
+def debug(msg: str) -> None:
+    """Lightweight debug logger."""
+    if not DEBUG:
+        return
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # use stdout so it lands in the same log file as other prints
+    print(f"[DEBUG {ts}] {msg}", flush=True)
 
 
 def update_global_variables(
@@ -168,7 +190,8 @@ def _exit_clean():
 
     if DUMMY_INTERFACE_CREATED:
         print("[+] Removing dummy interface...")
-        subprocess.check_call(shlex.split("sudo rm -f /etc/systemd/network/10-proxy.netdev /etc/systemd/network/20-proxy.network"))
+        subprocess.check_call(
+            shlex.split("sudo rm -f /etc/systemd/network/10-proxy.netdev /etc/systemd/network/20-proxy.network"))
         subprocess.check_call(shlex.split("sudo systemctl daemon-reload"))
         subprocess.check_call(shlex.split("sudo systemctl restart systemd-networkd"))
 
@@ -203,7 +226,7 @@ def _run_and_stream(
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,   # apt writes progress to stderr; merge it.
+        stderr=subprocess.STDOUT,  # apt writes progress to stderr; merge it.
         text=True,
         bufsize=1,
         env=env,
@@ -215,8 +238,8 @@ def _run_and_stream(
             chunk = proc.stdout.read(1024)
             if not chunk:
                 break
-            chunk = chunk.replace("\r", "\n")      # break overprinted lines
-            chunk = ansi.sub("", chunk)            # remove ANSI escapes
+            chunk = chunk.replace("\r", "\n")  # break overprinted lines
+            chunk = ansi.sub("", chunk)  # remove ANSI escapes
             for line in chunk.splitlines():
                 if line:
                     print(f"{prefix}{line}", flush=True)
@@ -228,16 +251,27 @@ def _run_and_stream(
 
 
 def run_full_apt_update(
-        proxy_ip: str,
-        proxy_port: int,
+        proxy_ip: str = None,
+        proxy_port: int = None,
 ):
     """
     The function removes current apt indexes and downloads the full set of indexes without diffs.
 
     :param proxy_ip: Proxy server IP address.
     :param proxy_port: Proxy server port.
+    If either proxy_ip or proxy_port is None, the 'apt update' command will not run with a proxy.
+
     :return: None
     """
+
+    if proxy_ip and not proxy_port:
+        raise ValueError("If proxy_ip is provided, proxy_port must also be provided.")
+    if proxy_port and not proxy_ip:
+        raise ValueError("If proxy_port is provided, proxy_ip must also be provided.")
+    if proxy_ip and proxy_port:
+        proxy: str | None = f"http://{proxy_ip}:{str(proxy_port)}"
+    else:
+        proxy = None
 
     # Make apt/dpkg behave nicely in non-interactive scripts.
     env = os.environ.copy()
@@ -247,24 +281,465 @@ def run_full_apt_update(
         "LC_ALL": "C",
     })
 
-    # Delete current apt indexes.
+    # === Disable daily apt services and wait for locks to be released =================================================
+    def _best_effort(cmd_list: list[str]) -> None:
+        subprocess.run(
+            cmd_list,
+            env=env,
+            check=False,  # best-effort: never raise
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    console.print("[+] Disabling daily apt services and waiting for locks to be released...", style="cyan")
+    # Avoid apt-daily races (best-effort; harmless if services don't exist)
+    _best_effort(["sudo", "systemctl", "stop", "apt-daily.timer", "apt-daily-upgrade.timer"])
+    _best_effort(["sudo", "systemctl", "stop", "apt-daily.service", "apt-daily-upgrade.service"])
+    _best_effort(["sudo", "systemctl", "kill", "--kill-who=all", "apt-daily.service", "apt-daily-upgrade.service"])
+
+    # Wait briefly for dpkg/apt locks to be released (best-effort)
+    lock_files = [
+        "/var/lib/dpkg/lock-frontend",
+        "/var/lib/dpkg/lock",
+        "/var/cache/apt/archives/lock",
+        "/var/lib/apt/lists/lock",
+    ]
+
+    for _ in range(30):
+        any_lock_held = False
+        for lock_path in lock_files:
+            # fuser returns 0 if any process is using the file, non-zero otherwise
+            r = subprocess.run(
+                ["sudo", "fuser", lock_path],
+                env=env,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if r.returncode == 0:
+                any_lock_held = True
+                break
+
+        if not any_lock_held:
+            break
+
+        time.sleep(1)
+    # === EOF Disable daily apt services and wait for locks to be released =============================================
+
+    console.print("[+] Removing pre-existing local .deb archives...", style="cyan")
+    # Remove any pre-existing local .deb archives so installs must download again
+    cmd = ["sudo", "apt-get", "clean"]
+    _run_and_stream(cmd, env=env, prefix="[apt] ")
+
+    cmd_string = 'sudo rm -rf /var/cache/apt/archives/*'
+    cmd = shlex.split(cmd_string)
+    subprocess.run(cmd, check=True)
+
+    console.print("[+] Removing pre-existing apt indexes...", style="cyan")
     subprocess.run(["sudo", "sh", "-c", "rm -rf /var/lib/apt/lists/*"], check=True)
 
-    # Update full indexes using the current proxy.
-    proxy = f"http://{proxy_ip}:{str(proxy_port)}"
-    cmd = [
+    console.print("[+] Running full apt update (no diffs)...", style="cyan")
+    cmd: list[str] = [
         "sudo", "apt", "update",
-        "-o", "Acquire::PDiffs=false",
-        "-o", f"Acquire::http::Proxy={proxy}",
-        "-o", f"Acquire::https::Proxy={proxy}",
+        "-o", "Acquire::PDiffs=false"
+    ]
+
+    if proxy:
+        cmd.extend([
+            "-o", f"Acquire::http::Proxy={proxy}",
+            "-o", f"Acquire::https::Proxy={proxy}",
+        ])
+
+    cmd.extend([
         # Adding these so there will be as much less pat output as possible, since it adds '\r' characters. and garbles the total output.
         "-o", "APT::Color=0",
         "-o", "Dpkg::Progress-Fancy=0",
-        "-qq",
-    ]
+        "-qq"
+    ])
     # subprocess.run(cmd, check=True)
     _run_and_stream(cmd, env=env, prefix="[apt] ")
+
+    console.print("[+] Prefetching Ubuntu apt news...", style="cyan")
+    if proxy:
+        cmd_string: str = f'wget -qO- -e use_proxy=yes -e http_proxy="{proxy}" -e https_proxy="{proxy}" https://motd.ubuntu.com/aptnews.json'
+    else:
+        cmd_string: str = 'wget -qO- https://motd.ubuntu.com/aptnews.json'
+    cmd = shlex.split(cmd_string)
+    _best_effort(cmd)
+
+    console.print("[+] Prefetching Ubuntu LTS meta-release file...", style="cyan")
+    if proxy:
+        cmd_string: str = f'wget -qO- -e use_proxy=yes -e http_proxy="{proxy}" -e https_proxy="{proxy}" https://changelogs.ubuntu.com/meta-release-lts'
+    else:
+        cmd_string: str = 'wget -qO- https://changelogs.ubuntu.com/meta-release-lts'
+    cmd = shlex.split(cmd_string)
+    _best_effort(cmd)
+
+    console.print("[+] Prefetching additional APT indices (DEP-11, icons, commands, all compressions)...", style="cyan")
+    try:
+        prefetch_all_apt_indices_with_wget(proxy=proxy, env=env)
+    except Exception as e:
+        console.print(f"[+] WARNING: additional APT index prefetch failed: {e}", style="yellow", markup=False)
+
     console.print("[+] Full apt update completed.", style="green")
+
+
+def prefetch_all_apt_indices_with_wget(proxy: str | None, env: dict) -> None:
+    """
+    Best-effort prefetch of additional APT repository metadata that is commonly requested by different Ubuntu
+    flavors (cloud/server/desktop) and clients, beyond the baseline `apt update` fetch.
+
+    Specifically aims to prime caches for:
+      - DEP-11 (AppStream) indices and icon tarballs
+      - Commands (cnf/Commands-*)
+      - Multiple compression variants present in Release/InRelease
+      - By-hash URLs (when available) in addition to plain paths
+
+    Notes:
+      - Uses wget (no curl).
+      - Reads active APT sources from /etc/apt/sources.list, /etc/apt/sources.list.d/*.list, and *.sources (Deb822).
+      - Skips failures (some repos may require auth; those should already be covered by the `apt update` step).
+
+    :param proxy: Proxy URL like "http://IP:PORT" or None.
+    :param env: Environment dict to use for subprocesses (noninteractive defaults are fine).
+    """
+
+    def _wget_capture(url: str, auth: tuple[str, str] | None = None) -> str:
+        debug(f"[prefetch] _wget_capture: {url}")
+        cmd = ["wget", "-qO-", "--timeout=20", "--tries=2"]
+        if proxy:
+            cmd += ["-e", "use_proxy=yes", "-e", f"http_proxy={proxy}", "-e", f"https_proxy={proxy}"]
+        if auth:
+            user, pw = auth
+            cmd += ["--auth-no-challenge", f"--user={user}", f"--password={pw}"]
+        cmd.append(url)
+        r = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"wget failed ({r.returncode}) for {url}")
+        return r.stdout
+
+    def _wget_discard(url: str, auth: tuple[str, str] | None = None) -> None:
+        debug(f"[prefetch] _wget_discard: {url}")
+        cmd = ["wget", "-q", "-O", "/dev/null", "--timeout=20", "--tries=2"]
+        if proxy:
+            cmd += ["-e", "use_proxy=yes", "-e", f"http_proxy={proxy}", "-e", f"https_proxy={proxy}"]
+        if auth:
+            user, pw = auth
+            cmd += ["--auth-no-challenge", f"--user={user}", f"--password={pw}"]
+        cmd.append(url)
+        subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+    def _read_apt_basic_auth_map() -> dict[str, tuple[str, str]]:
+        """
+        Parse /etc/apt/auth.conf and /etc/apt/auth.conf.d/* for entries like:
+          machine esm.ubuntu.com login bearer password <TOKEN>
+        Supports both single-line and multi-line netrc-like formats.
+        Returns: { host: (login, password) }
+        """
+        auth: dict[str, tuple[str, str]] = {}
+
+        def _norm_host(h: str) -> str:
+            h = h.strip()
+            h = re.sub(r"^https?://", "", h)
+            h = h.split("/", 1)[0]
+            h = h.split(":", 1)[0]
+            return h
+
+        candidates: list[Path] = [Path("/etc/apt/auth.conf")]
+        auth_d = Path("/etc/apt/auth.conf.d")
+        if auth_d.exists():
+            # include all files (Ubuntu Pro often uses non-.conf names)
+            candidates.extend(sorted([p for p in auth_d.iterdir() if p.is_file()]))
+
+        cur_host: str | None = None
+        cur_login: str | None = None
+        cur_pass: str | None = None
+
+        def _commit():
+            nonlocal cur_host, cur_login, cur_pass
+            if cur_host and cur_login and cur_pass:
+                auth[cur_host] = (cur_login, cur_pass)
+
+        for fp in candidates:
+            if not fp.exists():
+                continue
+            try:
+                for raw in fp.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = shlex.split(line)
+                    if not parts:
+                        continue
+
+                    if parts[0] == "machine" and len(parts) >= 2:
+                        _commit()
+                        cur_host = _norm_host(parts[1])
+                        cur_login = None
+                        cur_pass = None
+                        i = 2
+                        while i < len(parts):
+                            if parts[i] == "login" and (i + 1) < len(parts):
+                                cur_login = parts[i + 1]
+                                i += 2
+                                continue
+                            if parts[i] == "password" and (i + 1) < len(parts):
+                                cur_pass = parts[i + 1]
+                                i += 2
+                                continue
+                            i += 1
+                        continue
+
+                    if cur_host and parts[0] == "login" and len(parts) >= 2:
+                        cur_login = parts[1]
+                        continue
+                    if cur_host and parts[0] == "password" and len(parts) >= 2:
+                        cur_pass = parts[1]
+                        continue
+            except Exception:
+                continue
+
+        _commit()
+        return auth
+
+    def _auth_for_url(url: str, auth_map: dict[str, tuple[str, str]]) -> tuple[str, str] | None:
+        try:
+            host = urlparse(url).hostname or ""
+            host = host.split(":", 1)[0]
+            return auth_map.get(host)
+        except Exception:
+            return None
+
+    def _detect_ubuntu_codename() -> str | None:
+        for fp in (Path("/etc/os-release"), Path("/etc/lsb-release")):
+            if not fp.exists():
+                continue
+            try:
+                for raw in fp.read_text(encoding="utf-8", errors="replace").splitlines():
+                    ln = raw.strip()
+                    if ln.startswith("VERSION_CODENAME=") or ln.startswith("UBUNTU_CODENAME=") or ln.startswith(
+                            "DISTRIB_CODENAME="):
+                        _, v = ln.split("=", 1)
+                        v = v.strip().strip('"').strip("'")
+                        if v:
+                            return v
+            except Exception:
+                continue
+        return None
+
+    def _collect_esm_repos(auth_map: dict[str, tuple[str, str]]) -> set[tuple[str, str]]:
+        """
+        Add ESM (Ubuntu Pro) suites even if they are not currently enabled in sources.list,
+        so the proxy cache is primed for Pro-attached machines.
+        """
+        if "esm.ubuntu.com" not in auth_map:
+            return set()
+        codename = _detect_ubuntu_codename() or "noble"
+        return {
+            ("https://esm.ubuntu.com/apps/ubuntu", f"{codename}-apps-security"),
+            ("https://esm.ubuntu.com/apps/ubuntu", f"{codename}-apps-updates"),
+            ("https://esm.ubuntu.com/infra/ubuntu", f"{codename}-infra-security"),
+            ("https://esm.ubuntu.com/infra/ubuntu", f"{codename}-infra-updates"),
+        }
+
+    def _iter_sources_from_list_file(p: Path):
+        """
+        Parse legacy sources.list / *.list lines (deb / deb-src).
+
+        Handles optional bracketed options, e.g.:
+          deb [arch=amd64 signed-by=/path/keyring.gpg] https://example/repo noble main
+        """
+        try:
+            for raw in p.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if not (line.startswith("deb ") or line.startswith("deb-src ")):
+                    continue
+
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+
+                typ = parts[0]  # deb or deb-src
+
+                # Find the first token that looks like a URI.
+                uri_idx = None
+                for i in range(1, len(parts)):
+                    if re.match(r"^(https?|file)://", parts[i]):
+                        uri_idx = i
+                        break
+                if uri_idx is None or (uri_idx + 1) >= len(parts):
+                    continue
+
+                uri = parts[uri_idx]
+                suite = parts[uri_idx + 1]
+                comps = parts[uri_idx + 2:] if (uri_idx + 2) < len(parts) else []
+                yield typ, uri, suite, comps
+        except Exception:
+            return
+
+    def _iter_sources_from_deb822_file(p: Path):
+        """
+        Parse Deb822 sources format (*.sources).
+        We only need URIs + Suites for prefetch, because Release content tells us the actual index paths.
+        """
+        try:
+            content = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return
+
+        stanzas = re.split(r"\n\s*\n", content.strip(), flags=re.MULTILINE)
+        for stanza in stanzas:
+            if not stanza.strip():
+                continue
+            d = {}
+            for raw in stanza.splitlines():
+                if not raw.strip() or raw.lstrip().startswith("#"):
+                    continue
+                if ":" not in raw:
+                    continue
+                k, v = raw.split(":", 1)
+                d[k.strip().lower()] = v.strip()
+            types = (d.get("types") or "").split()
+            uris = (d.get("uris") or d.get("uri") or "").split()
+            suites = (d.get("suites") or d.get("suite") or "").split()
+            comps = (d.get("components") or "").split()
+            if not uris or not suites:
+                continue
+            for u in uris:
+                for s in suites:
+                    # Keep both deb and deb-src if declared; if Types missing, assume deb.
+                    if "deb-src" in types:
+                        yield "deb-src", u, s, comps
+                    if (not types) or ("deb" in types):
+                        yield "deb", u, s, comps
+
+    def _collect_active_repos() -> set[tuple[str, str]]:
+        repos: set[tuple[str, str]] = set()
+        base = Path("/etc/apt")
+        candidates: list[Path] = []
+        candidates.append(base / "sources.list")
+        candidates.extend(sorted((base / "sources.list.d").glob("*.list")))
+        candidates.extend(sorted((base / "sources.list.d").glob("*.sources")))
+
+        for p in candidates:
+            if not p.exists():
+                continue
+            if p.suffix == ".sources":
+                it = _iter_sources_from_deb822_file(p)
+            else:
+                it = _iter_sources_from_list_file(p)
+            for _typ, uri, suite, _comps in it:
+                if not uri or not suite:
+                    continue
+                # Normalize URI (strip trailing slashes)
+                repos.add((uri.rstrip("/"), suite))
+        return repos
+
+    def _parse_inrelease_sha256(inrel_text: str) -> list[tuple[str, str]]:
+        # Drop signature block if this is InRelease (clearsigned)
+        inrel_text = inrel_text.split("-----BEGIN PGP SIGNATURE-----", 1)[0]
+        lines = inrel_text.splitlines()
+
+        # Find SHA256 block
+        start = None
+        for i, ln in enumerate(lines):
+            if ln.strip() == "SHA256:":
+                start = i + 1
+                break
+        if start is None:
+            return []
+
+        sha_re = re.compile(r"^([0-9a-f]{64})\s+(\d+)\s+(\S+)$")
+        out: list[tuple[str, str]] = []
+        for ln in lines[start:]:
+            if ln.strip() in ("SHA1:", "MD5Sum:"):
+                break
+            m = sha_re.match(ln.strip())
+            if not m:
+                continue
+            sha, _size, path = m.group(1), m.group(2), m.group(3)
+            out.append((sha, path))
+        return out
+
+    def _is_interesting_index(path: str) -> bool:
+        # Packages/Sources and supporting metadata.
+        if re.search(r"/binary-(amd64|all|i386)/Packages(\.|$)", path):
+            return True
+        if re.search(r"/source/Sources(\.|$)", path):
+            return True
+        if re.search(r"/i18n/Translation-", path):
+            return True
+
+        # DEP-11 (AppStream) and icons.
+        if "/dep11/" in path:
+            return True
+
+        # Commands / cnf.
+        if "/cnf/Commands-" in path:
+            return True
+
+        # Contents indices (not always requested, but common tooling does).
+        if re.search(r"(^|/)Contents-", path):
+            return True
+
+        # Per-component Release files (small but helpful).
+        if path.endswith("/Release") or path.endswith("Release"):
+            return True
+
+        return False
+
+    auth_map = _read_apt_basic_auth_map()
+
+    repos = _collect_active_repos()
+    # Inject ESM repos (Ubuntu Pro) so caches are primed even if ESM is not enabled locally.
+    repos |= _collect_esm_repos(auth_map)
+
+    if not repos:
+        return
+
+    urls: set[str] = set()
+
+    for uri, suite in sorted(repos):
+        base = uri.rstrip("/")
+        base_auth = _auth_for_url(base, auth_map)
+
+        # Always attempt to prefetch the suite-level signed metadata.
+        urls.add(f"{base}/dists/{suite}/InRelease")
+        urls.add(f"{base}/dists/{suite}/Release")
+        urls.add(f"{base}/dists/{suite}/Release.gpg")
+
+        # Try InRelease first, then Release (both contain checksum sections).
+        rel_text = None
+        try:
+            rel_text = _wget_capture(f"{base}/dists/{suite}/InRelease", auth=base_auth)
+        except Exception:
+            try:
+                rel_text = _wget_capture(f"{base}/dists/{suite}/Release", auth=base_auth)
+            except Exception:
+                rel_text = None
+
+        if not rel_text:
+            continue
+
+        for sha, rel_path in _parse_inrelease_sha256(rel_text):
+            if not _is_interesting_index(rel_path):
+                continue
+
+            # Direct path URL
+            direct_url = f"{base}/dists/{suite}/{rel_path}"
+            urls.add(direct_url)
+
+            # By-hash URL (best-effort)
+            d = os.path.dirname(rel_path).strip("/")
+            if d:
+                by_hash_url = f"{base}/dists/{suite}/{d}/by-hash/SHA256/{sha}"
+                urls.add(by_hash_url)
+
+    # Fetch all URLs best-effort; order doesn't matter, but sorting makes logs deterministic.
+    for u in sorted(urls):
+        _wget_discard(u, auth=_auth_for_url(u, auth_map))
 
 
 def create_ca_certificates():
@@ -318,6 +793,7 @@ def create_crt_and_der_from_pem():
     The function extracts the first certificate block and writes it to squidCA.der and squidCA.crt files.
     :return:
     """
+
     def extract_certificate_from_pem(pem_file_data: bytes) -> bytes:
         """
         Extracts the first certificate block from a PEM file that contains multiple PEM objects.
@@ -444,6 +920,55 @@ def _serve_offline_token(handler):
     handler.wfile.write(body)
 
 
+def _serve_offline_referrers(handler):
+    """Return an empty OCI image index for referrers requests when origin is unavailable."""
+    body = b'{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}'
+    handler.send_response(200)
+    handler.send_header("Content-Type", "application/vnd.oci.image.index.v1+json")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _is_referrers_request(full_url: str) -> bool:
+    """
+    GHCR may redirect /v2/<name>/referrers/<digest> to a GitHub Packages endpoint.
+    This endpoint is optional metadata; returning an empty index is enough for pulls.
+    """
+    base, _, _q = full_url.partition("?")
+    host, _, rest = base.partition("/")
+    path = "/" + rest if rest else "/"
+    # Match both the OCI referrers endpoint and GitHub's redirected referrers URL.
+    if "/referrers/" in path:
+        return True
+    if "referrers" in path and host in ("github.com", "ghcr.io"):
+        return True
+    return False
+
+
+def _split_host_path_query(u):
+    base, _, query = u.partition("?")
+    if "://" in base:
+        p = urlparse(base)
+        host = p.netloc
+        path = p.path or "/"
+    else:
+        host, _, rest = base.partition("/")
+        path = "/" + rest if rest else "/"
+    if host.endswith(":443"):
+        host = host[:-4]
+    elif host.endswith(":80"):
+        host = host[:-3]
+    return host, path, query
+
+
+def _is_token_request(full_url):
+    _, path, query = _split_host_path_query(full_url)
+    if path.rstrip("/") == "/token":
+        return ("service=" in query) or ("scope=" in query) or ("client_id=" in query)
+    return False
+
+
 def generate_cache_key(
         method: str,
         url: str,
@@ -455,14 +980,13 @@ def generate_cache_key(
     :param url: string, the url to generate the key for.
     """
 
-    parsed = urlparse(url)
-
-    # Build the canonical part common to all requests.
-    normalized = parsed.netloc + parsed.path
-
-    # For everything that isn’t a registry-manifest keep the query
-    if parsed.query:
-        normalized += "?" + parsed.query
+    host, path, query = _split_host_path_query(url)
+    normalized = host + path
+    if _BLOB_DIGEST_RE.search(path):
+        query = ""
+    if query:
+        query = urlencode(sorted(parse_qsl(query, keep_blank_values=True)))
+        normalized += "?" + query
 
     # Prepend the HTTP method and (optionally) Accept header,
     # so HEAD ≠ GET and OCI ≠ Docker schema                          #
@@ -505,7 +1029,13 @@ def should_write_cache(status: int, path: str) -> bool:
     # Cache successes and redirects unconditionally
     if status < 400:
         return True
-    # The one exception: we want the 401 challenge on /v2/
+
+    # Cache 404 globally so offline mode replays "Not Found" instead of proxy 502.
+    # Many clients probe multiple candidate URLs and expect 404 as a valid signal.
+    if status == 404:
+        return True
+
+    # Keep the existing special-case: cache the 401 challenge on /v2/
     return status == 401 and path == "/v2/"
 
 
@@ -535,7 +1065,9 @@ class MitmHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         else:
             full_url = self.headers.get("Host", "unknown_host") + self.path
 
-        is_token_request: bool = "auth.docker.io/token" in full_url
+        is_token_request: bool = _is_token_request(full_url)
+        is_referrers_request: bool = _is_referrers_request(full_url)
+
         safe_key = generate_cache_key(method=self.command, url=full_url)
         cache_file = os.path.join(CACHE_DIRECTORY, safe_key)
 
@@ -552,33 +1084,99 @@ class MitmHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             with open(cache_file, 'rb') as f:
                 cached_response = pickle.load(f)
 
-            self._relay(cached_response)
+            cached_status = int(cached_response.get("status") or 0)
+            if is_referrers_request and 300 <= cached_status < 400:
+                print(f"Cached referrers response is a redirect ({cached_status}); ignoring cache and refetching: {full_url}")
+            elif cached_status == 304:
+                print(f"Cached object is 304; ignoring cache and refetching: {full_url}")
+            else:
+                self._relay(cached_response)
 
-            # file_hash = hashlib.sha256(cached_response['body']).hexdigest()
-            append_cached_log(full_url, safe_key, cached_response['sha256'])
-            append_request_log(timestamp, source_ip, self.command, full_url, target_port, cached_response['status'], safe_key, cached_response['sha256'])
-            resp_text = (f"Status: {cached_response['status']} {cached_response['reason']}\n"
-                         f"Headers: {cached_response['headers']}\n"
-                         f"Body (first {str(FULL_LOG_REQUEST_RESPONSE_TRUNCATION_LIMIT)} bytes): "
-                         f"{cached_response['body'][:FULL_LOG_REQUEST_RESPONSE_TRUNCATION_LIMIT]!r} (total {len(cached_response['body'])} bytes)")
-                         # f"Body: {cached_response['body']!r}")
-            if ENABLE_FULL_LOG:
-                log_full_pair(req_text, resp_text)
-            print(f"Served cached GET response from {cache_file}")
-            return
+                # file_hash = hashlib.sha256(cached_response['body']).hexdigest()
+                append_cached_log(full_url, safe_key, cached_response['sha256'])
+                append_request_log(timestamp, source_ip, self.command, full_url, target_port, cached_response['status'],
+                                   safe_key, cached_response['sha256'])
+                resp_text = (f"Status: {cached_response['status']} {cached_response['reason']}\n"
+                             f"Headers: {cached_response['headers']}\n"
+                             f"Body (first {str(FULL_LOG_REQUEST_RESPONSE_TRUNCATION_LIMIT)} bytes): "
+                             f"{cached_response['body'][:FULL_LOG_REQUEST_RESPONSE_TRUNCATION_LIMIT]!r} (total {len(cached_response['body'])} bytes)")
+                # f"Body: {cached_response['body']!r}")
+                if ENABLE_FULL_LOG:
+                    log_full_pair(req_text, resp_text)
+                print(f"Served cached GET response from {cache_file}")
+                return
 
         # ------------------------------------------------------------------ #
         # Forward to the real origin                                       #
         # ------------------------------------------------------------------ #
         try:
-            conn.request(self.command, parsed.path + ("?" + parsed.query if parsed.query else ""), headers=self.headers)
+            req_path = parsed.path + ("?" + parsed.query if parsed.query else "")
+            conn.request(self.command, req_path, headers=self.headers)
             remote_response = conn.getresponse()
+
+            # If origin says 304 Not Modified, re-fetch unconditionally to get a full body.
+            if remote_response.status == 304:
+                # drain the 304 response so we can reuse the connection cleanly
+                remote_response.read()
+
+                # strip conditional headers that trigger 304s
+                headers2 = {k: v for k, v in self.headers.items()}
+                for h in ("If-Modified-Since", "If-None-Match", "If-Match",
+                          "If-Unmodified-Since", "If-Range", "Range"):
+                    headers2.pop(h, None)
+
+                # retry same URL without validators => should return 200 with full body
+                conn.request(self.command, req_path, headers=headers2)
+                remote_response = conn.getresponse()
+
             body = remote_response.read()
+
+            # For referrers, hide 3xx redirects (GHCR -> github.com) by following them
+            # and caching the final 200 under the original referrers URL key.
+            resp_status = remote_response.status
+            resp_reason = remote_response.reason
+            resp_headers = remote_response.getheaders()
+            resp_body = body
+            synthetic_referrers = False
+            if is_referrers_request and 300 <= resp_status < 400:
+                location = remote_response.getheader("Location")
+                if location:
+                    try:
+                        max_hops = 3
+                        next_url = location
+                        for _ in range(max_hops):
+                            lp = urlparse(next_url)
+                            loc_host = lp.netloc or parsed.netloc or self.headers.get("Host", "unknown_host")
+                            loc_path = (lp.path or "/") + ("?" + lp.query if lp.query else "")
+                            conn2 = http.client.HTTPSConnection(loc_host)
+                            try:
+                                headers3 = {k: v for k, v in self.headers.items()}
+                                headers3["Host"] = loc_host
+                                conn2.request("GET", loc_path, headers=headers3)
+                                r2 = conn2.getresponse()
+                                b2 = r2.read()
+                            finally:
+                                conn2.close()
+                            if 300 <= r2.status < 400 and r2.getheader("Location"):
+                                next_url = r2.getheader("Location")
+                                continue
+                            resp_status, resp_reason, resp_headers, resp_body = r2.status, r2.reason, r2.getheaders(), b2
+                            break
+                    except Exception:
+                        # If we cannot follow the redirect, return an empty referrers index.
+                        synthetic_referrers = True
+                        resp_status, resp_reason = 200, "OK"
+                        resp_body = b'{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}'
+                        resp_headers = [("Content-Type", "application/vnd.oci.image.index.v1+json")]
         except Exception as e:
             _ = e
             # ---------------------- offline / error branch ---------------- #
             if is_token_request:
                 _serve_offline_token(self)  # never cached
+                return
+
+            if is_referrers_request:
+                _serve_offline_referrers(self)  # never cached
                 return
 
             if os.path.exists(cache_file):  # fall back to stale artefact
@@ -598,41 +1196,49 @@ class MitmHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         # ------------------------------------------------------------------ #
         # Relay live response – cache it unless it is a token             #
         # ------------------------------------------------------------------ #
-        self.send_response(remote_response.status, remote_response.reason)
-        for hdr, val in remote_response.getheaders():
+        self.send_response(resp_status, resp_reason)
+        for hdr, val in resp_headers:
             if hdr.lower() == "transfer-encoding":
                 continue
             self.send_header(hdr, val)
-        if "content-length" not in {h.lower() for h, _ in remote_response.getheaders()}:
-            self.send_header("Content-Length", str(len(body)))
+        if "content-length" not in {h.lower() for h, _ in resp_headers}:
+            self.send_header("Content-Length", str(len(resp_body)))
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(resp_body)
 
-        if (not is_token_request) and should_write_cache(remote_response.status, parsed.path):
+        resp_sha256 = hashlib.sha256(resp_body).hexdigest()
+
+        if (
+                (not is_token_request)
+                and (not synthetic_referrers)
+                and should_write_cache(resp_status, parsed.path)
+        ):
             # write-through cache
             # noinspection PyTypeChecker
             pickle.dump(
                 {
-                    "status": remote_response.status,
-                    "reason": remote_response.reason,
-                    "headers": remote_response.getheaders(),
-                    "body": body,
-                    "sha256": hashlib.sha256(body).hexdigest(),
+                    "status": resp_status,
+                    "reason": resp_reason,
+                    "headers": resp_headers,
+                    "body": resp_body,
+                    "sha256": resp_sha256,
                 },
                 open(cache_file, "wb")
             )
-            append_cached_log(full_url, safe_key, hashlib.sha256(body).hexdigest())
+            append_cached_log(full_url, safe_key, resp_sha256)
 
-        append_request_log(timestamp, source_ip, "GET",
-                           full_url, target_port, remote_response.status,
-                           "" if is_token_request else safe_key,
-                           "" if is_token_request else hashlib.sha256(body).hexdigest())
+        append_request_log(
+            timestamp, source_ip, "GET",
+            full_url, target_port, resp_status,
+            "" if is_token_request else safe_key,
+            "" if is_token_request else resp_sha256
+        )
 
         if ENABLE_FULL_LOG:
-            body_preview = body[:FULL_LOG_REQUEST_RESPONSE_TRUNCATION_LIMIT]
+            body_preview = resp_body[:FULL_LOG_REQUEST_RESPONSE_TRUNCATION_LIMIT]
             log_full_pair(
                 req_text,
-                f"Status: {remote_response.status}; body preview ({len(body)} bytes): {body_preview!r}"
+                f"Status: {resp_status}; body preview ({len(resp_body)} bytes): {body_preview!r}"
             )
 
         print(f"Forwarded GET {self.path} with response {remote_response.status}")
@@ -864,17 +1470,19 @@ class MitmHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(cached_response['body'])
                 file_hash = hashlib.sha256(cached_response['body']).hexdigest()
-                append_request_log(timestamp, source_ip, method, url_to_log, target_port, cached_response['status'], safe_key, file_hash)
+                append_request_log(timestamp, source_ip, method, url_to_log, target_port, cached_response['status'],
+                                   safe_key, file_hash)
                 resp_text = (f"Status: {cached_response['status']} {cached_response['reason']}\n"
                              f"Headers: {cached_response['headers']}\n"
                              f"Body (first {str(FULL_LOG_REQUEST_RESPONSE_TRUNCATION_LIMIT)} bytes): {cached_response['body'][:FULL_LOG_REQUEST_RESPONSE_TRUNCATION_LIMIT]!r} (total {len(cached_response['body'])} bytes)")
-                             # f"Body: {cached_response['body']!r}")
+                # f"Body: {cached_response['body']!r}")
                 if ENABLE_FULL_LOG:
                     log_full_pair(req_text, resp_text)
                 print(f"Served cached POST response from {cache_file}")
                 return
             try:
-                conn.request("POST", parsed.path + ("?" + parsed.query if parsed.query else ""), body=post_body, headers=self.headers)
+                conn.request("POST", parsed.path + ("?" + parsed.query if parsed.query else ""), body=post_body,
+                             headers=self.headers)
                 remote_response = conn.getresponse()
                 body = remote_response.read()
                 conn.close()
@@ -897,12 +1505,13 @@ class MitmHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 file_hash = hashlib.sha256(body).hexdigest()
-                append_request_log(timestamp, source_ip, method, url_to_log, target_port, remote_response.status, safe_key, file_hash)
+                append_request_log(timestamp, source_ip, method, url_to_log, target_port, remote_response.status,
+                                   safe_key, file_hash)
                 resp_text = (f"Status: {remote_response.status} {remote_response.reason}\n"
                              f"Headers: {remote_response.getheaders()}\n"
                              f"Body (first {str(FULL_LOG_REQUEST_RESPONSE_TRUNCATION_LIMIT)} bytes): "
                              f"{body[:FULL_LOG_REQUEST_RESPONSE_TRUNCATION_LIMIT]!r} (total {len(body)} bytes)")
-                             # f"Body: {body!r}")
+                # f"Body: {body!r}")
                 if ENABLE_FULL_LOG:
                     log_full_pair(req_text, resp_text)
                 print(f"Fetched and cached new POST response to {cache_file}")
@@ -920,12 +1529,13 @@ class MitmHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(cached_response['body'])
                     file_hash = hashlib.sha256(cached_response['body']).hexdigest()
-                    append_request_log(timestamp, source_ip, method, url_to_log, target_port, cached_response['status'], safe_key, file_hash)
+                    append_request_log(timestamp, source_ip, method, url_to_log, target_port, cached_response['status'],
+                                       safe_key, file_hash)
                     resp_text = (f"Status: {cached_response['status']} {cached_response['reason']}\n"
                                  f"Headers: {cached_response['headers']}\n"
                                  f"Body (first {str(FULL_LOG_REQUEST_RESPONSE_TRUNCATION_LIMIT)} bytes): "
                                  f"{cached_response['body'][:FULL_LOG_REQUEST_RESPONSE_TRUNCATION_LIMIT]!r} (total {len(cached_response['body'])} bytes)")
-                                 # f"Body: {cached_response['body']!r}")
+                    # f"Body: {cached_response['body']!r}")
                     if ENABLE_FULL_LOG:
                         log_full_pair(req_text, resp_text)
                     print(f"Network error; served cached POST response from {cache_file}")
@@ -934,7 +1544,8 @@ class MitmHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                     append_request_log(timestamp, source_ip, method, url_to_log, target_port, "", "", "")
         else:
             try:
-                conn.request("POST", parsed.path + ("?" + parsed.query if parsed.query else ""), body=post_body, headers=self.headers)
+                conn.request("POST", parsed.path + ("?" + parsed.query if parsed.query else ""), body=post_body,
+                             headers=self.headers)
                 remote_response = conn.getresponse()
                 body = remote_response.read()
                 conn.close()
@@ -947,12 +1558,13 @@ class MitmHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                     self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
-                append_request_log(timestamp, source_ip, method, url_to_log, target_port, remote_response.status, "", "")
+                append_request_log(timestamp, source_ip, method, url_to_log, target_port, remote_response.status, "",
+                                   "")
                 resp_text = (f"Status: {remote_response.status} {remote_response.reason}\n"
                              f"Headers: {remote_response.getheaders()}\n"
                              f"Body (first {str(FULL_LOG_REQUEST_RESPONSE_TRUNCATION_LIMIT)} bytes): "
                              f"{body[:FULL_LOG_REQUEST_RESPONSE_TRUNCATION_LIMIT]!r} (total {len(body)} bytes)")
-                             # f"Body: {body!r}")
+                # f"Body: {body!r}")
                 if ENABLE_FULL_LOG:
                     log_full_pair(req_text, resp_text)
                 print(f"Forwarded POST {self.path} with response {remote_response.status}")
@@ -1004,6 +1616,7 @@ class MitmHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                self.log_date_time_string(),
                format % args))
 
+
 class ThreadedTCPServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
 
@@ -1019,11 +1632,17 @@ def run_proxy_server(
     :param listen_port: integer, Port for the proxy server.
     """
 
+    debug(f"run_proxy_server(): binding to {listen_ip}:{listen_port}")
+
     # Passing "" as the first argument will bind to all interfaces, like 0.0.0.0
     # noinspection PyTypeChecker
     server = ThreadedTCPServer((listen_ip, listen_port), MitmHTTPRequestHandler)
+    debug("run_proxy_server(): server object created, calling serve_forever()")
     # print(f"MITM caching proxy server running on: {listen_ip}:{listen_port}")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        debug("run_proxy_server(): serve_forever() exited")
 
 
 def create_client_installation_files(
@@ -1048,8 +1667,6 @@ def create_client_installation_files(
         while using the docker [build command], also the CA certificate will be added+registered to the created image.
     :return:
     """
-
-
 
     if set_http + set_apt + set_docker_daemon + set_docker_build == 0:
         raise ValueError("At least one of the 'set_*' attributes must be True.")
@@ -1128,13 +1745,115 @@ fi'
 
     if set_apt:
         install_lines += [
-            """
+            r"""
 
 # ---- host APT -----------------------------------------------------------
+# Adding the proxy settings to APT configuration
 cat <<EOF | sudo tee /etc/apt/apt.conf.d/01proxy
 Acquire::http::Proxy  "${PROXY_URL}";
 Acquire::https::Proxy "${PROXY_URL}";
 EOF
+
+# ---- APT offline-friendly settings ---------------------------------------
+# Keep APT from pulling optional indices during offline runs (Dep11, Icons,
+# Translations), avoid PDiff churn, and prevent "Valid-Until" expiry issues.
+cat <<'EOF' | sudo tee /etc/apt/apt.conf.d/99proxy-cacher-offline.conf >/dev/null
+Acquire::PDiffs "false";
+Acquire::Languages "none";
+Acquire::By-Hash "no";
+Acquire::Check-Valid-Until "false";
+
+Acquire::Retries "1";
+# Acquire::IndexTargets::deb::DEP-11::DefaultEnabled "false";
+# Acquire::IndexTargets::deb::DEP-11-icons::DefaultEnabled "false";
+# Acquire::IndexTargets::deb::DEP-11-icons-small::DefaultEnabled "false";
+# Acquire::IndexTargets::deb::DEP-11-icons-hidpi::DefaultEnabled "false";
+# Acquire::IndexTargets::deb::Dep11::DefaultEnabled "false";
+# Acquire::IndexTargets::deb::dep11::DefaultEnabled "false";
+# Acquire::IndexTargets::deb::Icons::DefaultEnabled "false";
+# Acquire::IndexTargets::deb::Commands::DefaultEnabled "false";
+EOF
+
+
+# ---- Disable Ubuntu Pro / ESM repos (robust) ------------------------------
+# (Prevents attempts to reach esm.ubuntu.com even if "pro" tooling is absent
+# or does not fully remove apt source entries.)
+if command -v pro >/dev/null 2>&1; then
+  sudo pro disable esm-apps >/dev/null 2>&1 || true
+  sudo pro disable esm-infra >/dev/null 2>&1 || true
+fi
+
+# Comment out any esm.ubuntu.com entries in classic .list files (best-effort)
+for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+  [ -f "$f" ] || continue
+  sudo sed -i -E 's/^[[:space:]]*(deb(-src)?[[:space:]]+[^#]*esm\\.ubuntu\\.com)/# \\1/' "$f" 2>/dev/null || true
+done
+
+# Disable Deb822 .sources files that reference esm.ubuntu.com
+for f in /etc/apt/sources.list.d/*.sources; do
+  [ -f "$f" ] || continue
+  if grep -qiE 'esm\\.ubuntu\\.com' "$f"; then
+    sudo mv "$f" "$f.disabled" 2>/dev/null || true
+  fi
+done
+
+
+# ---- Canonicalize Ubuntu APT mirrors (avoid ccTLD mirrors like de.*) ----
+# Goal:
+#   - Ensure the client always uses archive.ubuntu.com + security.ubuntu.com
+#   - Eliminate duplicate sources (Deb822 ubuntu.sources vs our 00-ubuntu-canonical.list)
+#   - Prevent offline failures caused by requesting uncached geo-mirror hostnames
+
+(
+  # Contain strict mode to this block only (client_install.sh is commonly sourced).
+  set -euo pipefail
+
+  # Figure out release codename (jammy, noble, etc.)
+  codename=""
+  if [ -r /etc/os-release ]; then
+    . /etc/os-release
+    codename="${VERSION_CODENAME:-}"
+  fi
+  if [ -z "$codename" ] && command -v lsb_release >/dev/null 2>&1; then
+    codename="$(lsb_release -sc)"
+  fi
+  : "${codename:=stable}"
+
+  # 0) Explicitly disable Ubuntu's default Deb822 sources file if present
+  #    (this is the usual root cause of: de.archive.ubuntu.com + duplicate-target warnings)
+  if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+    sudo mv -f /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.disabled 2>/dev/null || true
+  fi
+
+  # 1) Disable any remaining Deb822 .sources files that reference Ubuntu mirrors
+  for f in /etc/apt/sources.list.d/*.sources; do
+    [ -f "$f" ] || continue
+    if grep -qiE '(archive|security|mirrors)\.ubuntu\.com|esm\.ubuntu\.com' "$f"; then
+      sudo mv -f "$f" "$f.disabled" 2>/dev/null || true
+    fi
+  done
+
+  # 2) Comment out existing Ubuntu mirror lines in classic .list files (including ccTLD like de.archive.ubuntu.com)
+  for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+    [ -f "$f" ] || continue
+    sudo sed -i -E '
+      s/^[[:space:]]*(deb(-src)?[[:space:]]+[^#]*https?:\/\/([a-z]{2}\.)?(archive|security)\.ubuntu\.com\/ubuntu)/# \1/
+      s/^[[:space:]]*(deb(-src)?[[:space:]]+[^#]*https?:\/\/mirrors\.ubuntu\.com\/ubuntu)/# \1/
+    ' "$f" 2>/dev/null || true
+  done
+
+  # 3) Add our canonical Ubuntu sources in a dedicated file (single source of truth)
+  sudo tee /etc/apt/sources.list.d/00-ubuntu-canonical.list >/dev/null <<EOF
+deb http://archive.ubuntu.com/ubuntu ${codename} main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu ${codename}-updates main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu ${codename}-backports main restricted universe multiverse
+deb http://security.ubuntu.com/ubuntu ${codename}-security main restricted universe multiverse
+EOF
+
+  # 4) Reset lists so the next apt update re-indexes ONLY against canonical hosts
+  sudo rm -rf /var/lib/apt/lists/* || true
+)
+# ---- END Canonicalize Ubuntu APT mirrors (avoid ccTLD mirrors like de.*) ----
 """]
 
     if set_docker_build:
@@ -1222,7 +1941,7 @@ real="$(find_real_docker)"
 if [[ $1 == build ]]; then
   ctx="${{@: -1}}"; [[ $ctx == -* ]] && ctx="."
   tmp=$(mktemp -d)
-  
+
   if command -v rsync >/dev/null 2>&1; then
     rsync -a --delete "$ctx"/ "$tmp"/
   else
@@ -1230,14 +1949,14 @@ if [[ $1 == build ]]; then
     (shopt -s dotglob; cp -a "$ctx"/* "$tmp"/ 2>/dev/null || true)
     ( [ -f "$ctx/Dockerfile" ] && cp -a "$ctx/Dockerfile" "$tmp"/ ) || true
   fi
-    
+
   # ensure there is a Dockerfile
   if [ ! -s "$tmp/Dockerfile" ]; then
     echo "ERROR: Dockerfile not found in context: $ctx" >&2
     rm -rf "$tmp"
     exit 2
   fi
-  
+
   cp {crt_ca_shared_target_path} "$tmp"/{crt_ca_file_name}
 
   cat >"$tmp"/.patch <<'PATCH'
@@ -1321,6 +2040,7 @@ fi'
             """# ---- host APT UNDO -------------------------------------------------------
 # Remove apt proxy configuration.
 sudo rm -f /etc/apt/apt.conf.d/01proxy
+sudo rm -f /etc/apt/apt.conf.d/99proxy-cacher-offline.conf
 """]
 
     if set_docker_build:
@@ -1371,8 +2091,815 @@ sudo rmdir /opt/docker-wrap 2>/dev/null || true
         f.write(uninstall_script)
     os.chmod(client_uninstall_file_path, 0o755)
 
+    # Write APT bundle helper scripts (Option A: local file:// repo).
+    # These are separate, explicitly-invoked scripts so you can run them at the correct points:
+    #   - create_apt_bundle.sh : run on ONLINE host after your installer finishes its apt operations
+    #   - install_apt_bundle.sh: run on OFFLINE host before your installer runs
+    if set_apt:
+        apt_bundle_create_script = r"""#!/usr/bin/env bash
+set -Eeuo pipefail
+
+OUT="${1:-__APT_BUNDLE_DEFAULT_ARCHIVE_PATH__}"
+
+log(){ echo "[apt-bundle] $*"; }
+
+# ---- knobs ----------------------------------------------------------------
+HISTORY_ACTION_RE="${APT_BUNDLE_HISTORY_ACTION_RE:-Install|Reinstall}"
+
+# History parsing mode:
+#   - "day"   : include apt history entries from the last N days (default: 1 day)
+#   - "lines" : include the last X lines across all history.log* (including rotated/compressed)
+#   - "all"   : include all history.log* (including rotated/compressed)
+HISTORY_MODE="${APT_BUNDLE_HISTORY_MODE:-day}"
+HISTORY_LINES="${APT_BUNDLE_HISTORY_LINES:-2000}"
+HISTORY_DAYS="${APT_BUNDLE_HISTORY_DAYS:-1}"
+
+# BFS-only dependency fields (used when solver is disabled or fails)
+DEP_FIELDS_RE="${APT_BUNDLE_DEP_FIELDS_RE:-PreDepends|Depends|Recommends}"
+
+# Safety valve: abort if dependency closure explodes.
+MAX_PKGS="${APT_BUNDLE_MAX_PKGS:-5000}"
+
+# Prefer APT solver (download-only install in isolated state) to avoid missing deps.
+# Set to 1 to enable, 0 to disable.
+USE_SOLVER="${APT_BUNDLE_USE_SOLVER:-1}"
+
+# Solver status mode: "empty" downloads full closure; "current" uses current dpkg status.
+SOLVER_STATUS="${APT_BUNDLE_SOLVER_STATUS:-empty}"
+
+# Install-Recommends behavior for solver mode: 1 (yes) / 0 (no).
+INSTALL_RECOMMENDS="${APT_BUNDLE_INSTALL_RECOMMENDS:-1}"
+
+# If 1, allow falling back from pkg:arch to pkg (may download wrong arch in some cases).
+ALLOW_ARCH_FALLBACK="${APT_BUNDLE_ALLOW_ARCH_FALLBACK:-0}"
+
+HOST_ARCH="$(dpkg --print-architecture 2>/dev/null || true)"
+
+abspath() {
+  if command -v readlink >/dev/null 2>&1; then
+    readlink -f "$1" 2>/dev/null && return 0
+  fi
+  python3 - <<'PY' "$1"
+import os,sys
+print(os.path.abspath(sys.argv[1]))
+PY
+}
+
+OUT="$(abspath "$OUT")"
+TMP_DIR="$(mktemp -d)"
+log "TMP_DIR: $TMP_DIR"
+if [ "${APT_BUNDLE_KEEP_TMP:-0}" != "1" ]; then
+  trap 'rm -rf "$TMP_DIR"' EXIT
+else
+  log "Keeping TMP_DIR (APT_BUNDLE_KEEP_TMP=1); no auto-cleanup will run."
+fi
+
+REPO_DIR="$TMP_DIR/apt-localrepo"
+POOL_DIR="$REPO_DIR/pool"
+mkdir -p "$POOL_DIR" "$POOL_DIR/partial"
+log "POOL_DIR: $POOL_DIR"
+
+log "Refreshing APT indices (best-effort)..."
+sudo apt-get update >/dev/null 2>&1 || true
+
+# ---- determine root packages ----------------------------------------------
+ROOT_PKGS=""
+
+read_apt_history_recent() {
+  # Reads /var/log/apt/history.log* (including rotated/compressed),
+  # then filters per HISTORY_MODE:
+  #   - day: keep stanzas whose Start-Date is within last HISTORY_DAYS days
+  #   - lines: keep last HISTORY_LINES lines
+  #   - all: keep all
+  #
+  # Output: filtered history text to stdout (may be empty).
+  python3 - <<'PY' "$HISTORY_MODE" "$HISTORY_LINES" "$HISTORY_DAYS"
+import sys, os, glob, gzip, datetime, re
+
+mode = (sys.argv[1] or "day").strip().lower()
+try:
+  lines_n = int(sys.argv[2])
+except Exception:
+  lines_n = 2000
+try:
+  days_n = int(sys.argv[3])
+except Exception:
+  days_n = 1
+
+paths = glob.glob("/var/log/apt/history.log*")
+paths = [p for p in paths if os.path.isfile(p)]
+paths.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0)
+
+def read_file(p: str) -> str:
+  try:
+    if p.endswith(".gz"):
+      with gzip.open(p, "rb") as f:
+        return f.read().decode("utf-8", errors="replace")
+    with open(p, "rb") as f:
+      return f.read().decode("utf-8", errors="replace")
+  except Exception:
+    return ""
+
+content = "".join(read_file(p) for p in paths)
+
+if not content.strip():
+  sys.stdout.write("")
+  sys.exit(0)
+
+if mode == "all":
+  sys.stdout.write(content)
+  sys.exit(0)
+
+if mode == "lines":
+  if lines_n <= 0:
+    sys.stdout.write("")
+    sys.exit(0)
+  lines = content.splitlines(True)  # keep line endings
+  sys.stdout.write("".join(lines[-lines_n:]))
+  sys.exit(0)
+
+# Default: "day"
+now = datetime.datetime.now()
+cutoff = now - datetime.timedelta(days=max(days_n, 1))
+
+# Split into "blocks" separated by blank lines (APT history entries are block-oriented).
+# We reconstruct blocks with "\n\n" to keep roughly the original separation.
+blocks = re.split(r"\n\s*\n", content.strip("\n"))
+kept = []
+
+start_re = re.compile(r"^Start-Date:\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})", re.M)
+
+for b in blocks:
+  if not b.strip():
+    continue
+  m = start_re.search(b)
+  if not m:
+    # If we cannot parse Start-Date, keep it (best-effort; avoids false negatives).
+    kept.append(b)
+    continue
+  dt_s = f"{m.group(1)} {m.group(2)}"
+  try:
+    dt = datetime.datetime.strptime(dt_s, "%Y-%m-%d %H:%M:%S")
+  except Exception:
+    kept.append(b)
+    continue
+  if dt >= cutoff:
+    kept.append(b)
+
+sys.stdout.write(("\n\n".join(kept) + "\n") if kept else "")
+PY
+}
+
+log "History parse mode: $HISTORY_MODE (days=$HISTORY_DAYS, lines=$HISTORY_LINES)"
+
+RECENT=""
+if RECENT="$(read_apt_history_recent)"; then
+  :
+fi
+
+if [ -n "${RECENT:-}" ]; then
+  # Join wrapped continuation lines (indented) to their previous line.
+  JOINED="$(printf '%s\n' "$RECENT" | awk '
+    /^[[:space:]]/ {
+      sub(/^[[:space:]]+/, "", $0);
+      if(prev!=""){ prev = prev " " $0; next }
+    }
+    { if(prev!="") print prev; prev=$0 }
+    END{ if(prev!="") print prev }
+  ')"
+
+  extract_cmdline_install_pkgs() {
+    local line="$1"
+    set -- $line
+
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        sudo|env) shift ;;
+        *) break ;;
+      esac
+    done
+
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        apt|apt-get) shift; break ;;
+        *) shift ;;
+      esac
+    done
+
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        install|reinstall) shift; break ;;
+        *) shift ;;
+      esac
+    done
+
+    [ $# -gt 0 ] || return 0
+
+    for a in "$@"; do
+      case "$a" in
+        -*|/*|./*|../*|*.deb) continue ;;
+      esac
+      a="${a%%=*}"
+      [ -n "$a" ] && echo "$a"
+    done
+  }
+
+  CMD_PKGS="$(
+    printf '%s\n' "$RECENT" \
+      | awk -F': ' '/^Commandline:/ {print $2}' \
+      | while IFS= read -r line; do
+          extract_cmdline_install_pkgs "$line"
+        done \
+      | awk 'NF' \
+      | sort -u
+  )"
+
+  if [ -n "$CMD_PKGS" ]; then
+    ROOT_PKGS="$CMD_PKGS"
+  else
+    ROOT_PKGS="$(printf '%s\n' "$JOINED" \
+      | sed -nE "s/^(${HISTORY_ACTION_RE}):[[:space:]]*//p" \
+      | sed -E 's/\),[[:space:]]*/)\n/g' \
+      | sed -E 's/^[[:space:]]+|[[:space:]]+$//g' \
+      | awk 'NF {print $1}' \
+      | sort -u)"
+  fi
+else
+  log "No apt history content found in /var/log/apt/history.log*; proceeding with cached archives only."
+fi
+
+BOOTSTRAP_PKGS=(curl dos2unix libarchive-tools ca-certificates)
+ROOT_PKGS="$(printf '%s\n' "${BOOTSTRAP_PKGS[@]}" $ROOT_PKGS | awk 'NF' | sort -u)"
+log "Root packages: $(printf '%s\n' "$ROOT_PKGS" | awk 'NF' | wc -l)"
+
+ROOT_ARGS=()
+while IFS= read -r p; do
+  [ -n "$p" ] && ROOT_ARGS+=("$p")
+done <<< "$ROOT_PKGS"
+
+# ---- common helpers --------------------------------------------------------
+download_one_pkg() {
+  local pkg="$1"
+
+  if apt-get -o APT::Color=0 -o Dpkg::Progress-Fancy=0 download "$pkg"; then
+    return 0
+  fi
+
+  # Only drop :arch if it's host arch (or if explicitly allowed)
+  if [[ "$pkg" == *:* ]]; then
+    local base="${pkg%%:*}"
+    local arch="${pkg##*:}"
+    if [ -n "$HOST_ARCH" ] && [ "$arch" = "$HOST_ARCH" ]; then
+      apt-get -o APT::Color=0 -o Dpkg::Progress-Fancy=0 download "$base" && return 0
+    fi
+    if [ "$ALLOW_ARCH_FALLBACK" = "1" ]; then
+      apt-get -o APT::Color=0 -o Dpkg::Progress-Fancy=0 download "$base" && return 0
+    fi
+  fi
+
+  return 1
+}
+
+build_packages_index() {
+  log "Building Packages.gz..."
+  if command -v dpkg-scanpackages >/dev/null 2>&1; then
+    (cd "$REPO_DIR" && dpkg-scanpackages -m pool /dev/null | gzip -9c > Packages.gz)
+  else
+    local PKGFILE="$REPO_DIR/Packages"
+    : > "$PKGFILE"
+    shopt -s nullglob
+    for deb in "$POOL_DIR"/*.deb; do
+      local rel="pool/$(basename "$deb")"
+      local size md5 sha256
+      size=$(stat -c%s "$deb" 2>/dev/null || wc -c <"$deb")
+      md5=$(md5sum "$deb" | awk '{print $1}')
+      sha256=$(sha256sum "$deb" | awk '{print $1}')
+      dpkg-deb -f "$deb" Package Version Architecture Maintainer Installed-Size Depends Pre-Depends Recommends Suggests Conflicts Breaks Replaces Provides Section Priority Description Homepage 2>/dev/null \
+        >> "$PKGFILE" || true
+      {
+        echo "Filename: $rel"
+        echo "Size: $size"
+        echo "MD5sum: $md5"
+        echo "SHA256: $sha256"
+        echo
+      } >> "$PKGFILE"
+    done
+    gzip -9c "$PKGFILE" > "$REPO_DIR/Packages.gz"
+    rm -f "$PKGFILE"
+  fi
+}
+
+# ---- solver path (preferred) ----------------------------------------------
+solver_download_all() {
+  local apt_env="$TMP_DIR/apt-solver"
+  local apt_state="$apt_env/var/lib/apt"
+  local apt_cache="$apt_env/var/cache/apt"
+  local dpkg_dir="$apt_env/var/lib/dpkg"
+  local status_file="$dpkg_dir/status"
+
+  mkdir -p \
+    "$apt_state/lists/partial" \
+    "$apt_cache/archives/partial" \
+    "$dpkg_dir" \
+    "$POOL_DIR/partial"
+
+  if [ "$SOLVER_STATUS" = "current" ] && [ -f /var/lib/dpkg/status ]; then
+    cp -f /var/lib/dpkg/status "$status_file"
+  else
+    : > "$status_file"
+  fi
+
+  log "Solver: isolated apt-get update (state in $apt_env)..."
+  apt-get \
+    -o Dir::Etc::sourcelist="/etc/apt/sources.list" \
+    -o Dir::Etc::sourceparts="/etc/apt/sources.list.d" \
+    -o Dir::State="$apt_state" \
+    -o Dir::Cache="$apt_cache" \
+    -o Dir::State::status="$status_file" \
+    -o Acquire::Languages=none \
+    -o APT::Get::List-Cleanup=0 \
+    -o Debug::NoLocking=1 \
+    update >/dev/null 2>&1 || {
+      log "Solver: WARNING: apt-get update failed in isolated env; proceeding anyway."
+    }
+
+  log "Solver: download-only install; status=$SOLVER_STATUS; Install-Recommends=$INSTALL_RECOMMENDS"
+  if ! apt-get \
+    -y --download-only \
+    -o Dir::Etc::sourcelist="/etc/apt/sources.list" \
+    -o Dir::Etc::sourceparts="/etc/apt/sources.list.d" \
+    -o Dir::State="$apt_state" \
+    -o Dir::Cache="$apt_cache" \
+    -o Dir::Cache::archives="$POOL_DIR" \
+    -o Dir::State::status="$status_file" \
+    -o Acquire::Languages=none \
+    -o APT::Get::List-Cleanup=0 \
+    -o APT::Install-Recommends="$INSTALL_RECOMMENDS" \
+    -o APT::Install-Suggests=0 \
+    -o Debug::NoLocking=1 \
+    -o Dpkg::Use-Pty=0 \
+    -o Dpkg::Progress-Fancy=0 \
+    install "${ROOT_ARGS[@]}" \
+    >/dev/null 2>&1; then
+      log "Solver: FAILED (some packages may be unavailable from configured repositories)."
+      return 1
+  fi
+
+  return 0
+}
+
+# ---- BFS fallback (virtual resolution) ------------------------------------
+has_candidate() {
+  local p="$1"
+  local cand
+  cand="$(apt-cache policy "$p" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+  [ -n "$cand" ] && [ "$cand" != "(none)" ]
+}
+
+is_installed() {
+  dpkg-query -W -f='${Status}\n' "$1" 2>/dev/null | grep -q '^install ok installed$'
+}
+
+resolve_virtual() {
+  local virt="$1"
+  virt="${virt#<}"; virt="${virt%>}"
+
+  local providers
+  providers="$(
+    apt-cache showpkg "$virt" 2>/dev/null | awk '
+      /^Reverse Provides:/{p=1; next}
+      p && NF==0 {exit}
+      p && NF {
+        if ($1 ~ /:$/) print $2; else print $1
+      }' \
+    | sed -E 's/:any$//' \
+    | sort -u
+  )"
+
+  [ -n "$providers" ] || return 0
+
+  while IFS= read -r prov; do
+    [ -n "$prov" ] || continue
+    if is_installed "$prov"; then
+      echo "$prov"
+      return 0
+    fi
+  done <<< "$providers"
+
+  while IFS= read -r prov; do
+    [ -n "$prov" ] || continue
+    if has_candidate "$prov"; then
+      echo "$prov"
+      return 0
+    fi
+  done <<< "$providers"
+
+  printf '%s\n' "$providers"
+}
+
+bfs_download_all() {
+  log "BFS: expanding dependency closure (fields: $DEP_FIELDS_RE)..."
+
+  declare -A seen=()
+  queue=()
+
+  enqueue_pkg() {
+    local p="$1"
+    [ -z "$p" ] && return 0
+    p="${p%%=*}"
+    p="${p%:any}"
+
+    if [[ "$p" =~ ^\<.*\>$ ]]; then
+      while IFS= read -r rp; do
+        [ -n "$rp" ] && enqueue_pkg "$rp"
+      done < <(resolve_virtual "$p")
+      return 0
+    fi
+
+    [[ "$p" =~ ^\< ]] && return 0
+
+    if [ -z "${seen[$p]+x}" ]; then
+      seen["$p"]=1
+      queue+=("$p")
+    fi
+  }
+
+  while IFS= read -r p; do
+    enqueue_pkg "$p"
+  done <<< "$ROOT_PKGS"
+
+  idx=0
+  while [ $idx -lt ${#queue[@]} ]; do
+    pkg="${queue[$idx]}"
+    idx=$((idx+1))
+
+    candidates=("$pkg")
+    if [[ "$pkg" == *:* ]]; then
+      candidates+=("${pkg%%:*}")
+    fi
+
+    dep_out=""
+    for c in "${candidates[@]}"; do
+      dep_out="$(apt-cache depends "$c" 2>/dev/null || true)"
+      [ -n "$dep_out" ] && break
+    done
+    [ -n "$dep_out" ] || continue
+
+    while IFS= read -r dep; do
+      dep="$(echo "$dep" | sed -E 's/[[:space:]].*$//' | sed -E 's/:any$//')"
+      [ -z "$dep" ] && continue
+      enqueue_pkg "$dep"
+    done < <(printf '%s\n' "$dep_out" | sed -nE "s/^[| ]*(${DEP_FIELDS_RE}):[[:space:]]*//p")
+  done
+
+  ALL_PKGS="$(printf '%s\n' "${!seen[@]}" | awk 'NF' | sort -u)"
+  pkg_count="$(printf '%s\n' "$ALL_PKGS" | awk 'NF' | wc -l | tr -d ' ')"
+  log "BFS: package set (root + deps): $pkg_count unique"
+
+  if [ "$pkg_count" -gt "$MAX_PKGS" ]; then
+    log "ERROR: package set too large ($pkg_count > $MAX_PKGS). Aborting."
+    exit 2
+  fi
+
+  log "BFS: downloading via apt-get download (best-effort)..."
+  total="$pkg_count"
+  i=0
+  fail_list=()
+
+  pushd "$POOL_DIR" >/dev/null
+  while IFS= read -r pkg; do
+    [ -z "$pkg" ] && continue
+    i=$((i+1))
+    log "  [$i/$total] downloading: $pkg"
+    if ! download_one_pkg "$pkg"; then
+      fail_list+=("$pkg")
+    fi
+  done <<< "$ALL_PKGS"
+  popd >/dev/null
+
+  if ((${#fail_list[@]})); then
+    log "WARNING: failed downloads (${#fail_list[@]}):"
+    printf '%s\n' "${fail_list[@]}" | sed 's/^/  - /'
+  fi
+
+  return 0
+}
+
+# ---- execute download strategy --------------------------------------------
+if [ "$USE_SOLVER" = "1" ]; then
+  log "Using solver-based download (recommended)."
+  if ! solver_download_all; then
+    log "Falling back to BFS-based dependency expansion + download."
+    bfs_download_all
+  fi
+else
+  log "Using BFS-based dependency expansion + download (APT_BUNDLE_USE_SOLVER=0)."
+  bfs_download_all
+fi
+
+log "Copying existing cached archives..."
+sudo find /var/cache/apt/archives -maxdepth 1 -type f -name '*.deb' -print0 2>/dev/null \
+  | xargs -0 -I{} cp -n "{}" "$POOL_DIR/" 2>/dev/null || true
+
+build_packages_index
+
+log "Creating archive: $OUT"
+mkdir -p "$(dirname "$OUT")"
+tar -C "$TMP_DIR" -czf "$OUT" "apt-localrepo"
+
+log "Done. Debs: $(find "$POOL_DIR" -maxdepth 1 -name '*.deb' 2>/dev/null | wc -l)"
+"""
+
+        apt_bundle_install_script = r"""#!/bin/bash
+set -Eeuo pipefail
+
+log(){ echo "[apt-bundle] $*"; }
+
+DEFAULT_ARCHIVE="__APT_BUNDLE_DEFAULT_ARCHIVE_PATH__"
+
+usage() {
+  cat <<EOF
+Usage:
+  $(basename "$0") -a    Add/register the bundle as a local APT repo (uses \$APT_BUNDLE_ARCHIVE or default)
+  $(basename "$0") -r    Remove the local APT repo from APT sources (restores backups if present)
+  $(basename "$0") -h    Help
+
+Environment:
+  APT_BUNDLE_ARCHIVE        Override bundle archive path (used with -a)
+  APT_BUNDLE_TARGET_ROOT    Install repo here (default: /opt/proxy-cacher-apt-repo)
+  APT_BUNDLE_KEEP_TMP=1     Keep temp dir for debugging (used with -a)
+EOF
+}
+
+ACTION=""
+while getopts ":arh" opt; do
+  case "$opt" in
+    a) ACTION="add" ;;
+    r) ACTION="remove" ;;
+    h) usage; exit 0 ;;
+    \?) echo "[apt-bundle] ERROR: Unknown option -$OPTARG" >&2; usage; exit 2 ;;
+  esac
+done
+shift $((OPTIND-1))
+if [ -n "${1:-}" ]; then
+  echo "[apt-bundle] ERROR: Unexpected positional args: $*" >&2
+  usage
+  exit 2
+fi
+if [ -z "$ACTION" ]; then
+  echo "[apt-bundle] ERROR: You must specify exactly one of -a or -r" >&2
+  usage
+  exit 2
+fi
+
+abspath() {
+  if command -v readlink >/dev/null 2>&1; then
+    readlink -f "$1" 2>/dev/null && return 0
+  fi
+  python3 - <<'PY' "$1"
+import os,sys
+print(os.path.abspath(sys.argv[1]))
+PY
+}
+
+# Allow override; default matches your usage.
+TARGET_ROOT="${APT_BUNDLE_TARGET_ROOT:-/opt/proxy-cacher-apt-repo}"
+BACKUP_ROOT="/etc/apt/offline-bundle-backup"
+LIST_FILE="/etc/apt/sources.list.d/00offline-localrepo.list"
+OFFLINE_CONF="/etc/apt/apt.conf.d/99offline-localrepo.conf"
+
+backup_and_disable_sources_once() {
+  sudo mkdir -p "$BACKUP_ROOT"
+  STAMP="$(date +%Y%m%d_%H%M%S)"
+  if [ ! -f "$BACKUP_ROOT/.disabled" ]; then
+    log "Backing up and disabling existing APT sources..."
+
+    if [ -f /etc/apt/sources.list ]; then
+      sudo cp -a /etc/apt/sources.list "$BACKUP_ROOT/sources.list.$STAMP"
+      sudo sh -c 'cat > /etc/apt/sources.list <<EOF
+# Disabled by install_apt_bundle.sh (offline install)
+EOF'
+    fi
+
+    if [ -d /etc/apt/sources.list.d ]; then
+      sudo cp -a /etc/apt/sources.list.d "$BACKUP_ROOT/sources.list.d.$STAMP"
+      # Disable classic .list entries
+      sudo find /etc/apt/sources.list.d -maxdepth 1 -type f -name "*.list" -exec sudo mv {} {}.disabled \; || true
+      # Disable Deb822 .sources entries (Ubuntu defaults live here)
+      sudo find /etc/apt/sources.list.d -maxdepth 1 -type f -name "*.sources" -exec sudo mv {} {}.disabled \; || true
+    fi
+
+    sudo touch "$BACKUP_ROOT/.disabled"
+  fi
+}
+
+restore_sources_if_backed_up() {
+  if [ ! -f "$BACKUP_ROOT/.disabled" ]; then
+    log "No backup marker found ($BACKUP_ROOT/.disabled). Skipping restore."
+    return 0
+  fi
+
+  log "Restoring APT sources from $BACKUP_ROOT ..."
+
+  latest_sources_list="$(ls -1t "$BACKUP_ROOT"/sources.list.* 2>/dev/null | head -n1 || true)"
+  if [ -n "$latest_sources_list" ]; then
+    sudo cp -a "$latest_sources_list" /etc/apt/sources.list
+  else
+    log "WARNING: No backed-up sources.list found; leaving /etc/apt/sources.list as-is."
+  fi
+
+  latest_sources_list_d="$(ls -1dt "$BACKUP_ROOT"/sources.list.d.* 2>/dev/null | head -n1 || true)"
+  if [ -n "$latest_sources_list_d" ]; then
+    sudo rm -rf /etc/apt/sources.list.d
+    sudo cp -a "$latest_sources_list_d" /etc/apt/sources.list.d
+  else
+    log "WARNING: No backed-up sources.list.d found; best-effort re-enable *.disabled files."
+    if [ -d /etc/apt/sources.list.d ]; then
+      sudo find /etc/apt/sources.list.d -maxdepth 1 -type f -name "*.disabled" -print0 2>/dev/null \
+        | while IFS= read -r -d '' f; do
+            sudo mv "$f" "${f%.disabled}" || true
+          done
+    fi
+  fi
+
+  sudo rm -f "$BACKUP_ROOT/.disabled"
+}
+
+add_repo() {
+  ARCHIVE="${APT_BUNDLE_ARCHIVE:-$DEFAULT_ARCHIVE}"
+  ARCHIVE="$(abspath "$ARCHIVE")"
+
+  if [ ! -f "$ARCHIVE" ]; then
+    echo "[apt-bundle] ERROR: archive not found: $ARCHIVE" >&2
+    exit 1
+  fi
+
+  TMP_DIR="$(mktemp -d)"
+  log "TMP_DIR: $TMP_DIR"
+  if [ "${APT_BUNDLE_KEEP_TMP:-0}" != "1" ]; then
+    trap 'rm -rf "$TMP_DIR"' EXIT
+  else
+    log "Keeping TMP_DIR (APT_BUNDLE_KEEP_TMP=1); no auto-cleanup will run."
+  fi
+
+  log "Installing local APT repo bundle..."
+  log "  Bundle: $ARCHIVE"
+  log "  Repo  : $TARGET_ROOT"
+
+  log "Extracting bundle..."
+  tar -C "$TMP_DIR" -xzf "$ARCHIVE"
+
+  sudo mkdir -p "$(dirname "$TARGET_ROOT")"
+  sudo rm -rf "$TARGET_ROOT"
+  sudo mv "$TMP_DIR/apt-localrepo" "$TARGET_ROOT"
+  sudo chown -R root:root "$TARGET_ROOT"
+
+  # Flat file:// repos often require an uncompressed Packages index.
+  if [ ! -f "$TARGET_ROOT/Packages" ] && [ -f "$TARGET_ROOT/Packages.gz" ]; then
+    log "Generating uncompressed Packages from Packages.gz..."
+    sudo gzip -dc "$TARGET_ROOT/Packages.gz" | sudo tee "$TARGET_ROOT/Packages" >/dev/null
+    sudo chown root:root "$TARGET_ROOT/Packages"
+  fi
+
+  # Offline-friendly APT behavior.
+  # NOTE: Acquire::By-Hash can trigger "Method gave a blank filename" with file:// repos on some setups.
+  sudo tee "$OFFLINE_CONF" >/dev/null <<'EOF'
+Acquire::Languages "none";
+Acquire::PDiffs "false";
+Acquire::By-Hash "no";
+Acquire::Check-Valid-Until "false";
+Acquire::Retries "0";
+EOF
+
+  # Backup+disable external sources once to prevent apt from trying the network.
+  backup_and_disable_sources_once
+
+  log "Registering local file:// repo..."
+  sudo tee "$LIST_FILE" >/dev/null <<EOF
+deb [trusted=yes] file:${TARGET_ROOT}/ ./
+EOF
+
+  log "Running apt-get update..."
+  sudo apt-get \
+    -o Acquire::Languages=none \
+    -o Acquire::PDiffs=false \
+    -o Acquire::By-Hash=0 \
+    -o Acquire::Retries=0 \
+    update
+
+  log "APT local repo active: file:${TARGET_ROOT}/"
+}
+
+remove_repo() {
+  log "Removing local APT repo registration..."
+  sudo rm -f "$LIST_FILE" || true
+  sudo rm -f "$OFFLINE_CONF" || true
+
+  restore_sources_if_backed_up
+
+  log "Running apt-get update (best-effort)..."
+  sudo apt-get \
+    -o Acquire::Languages=none \
+    -o Acquire::PDiffs=false \
+    -o Acquire::By-Hash=0 \
+    -o Acquire::Retries=0 \
+    update || true
+
+  log "APT local repo removed."
+}
+
+case "$ACTION" in
+  add) add_repo ;;
+  remove) remove_repo ;;
+esac
+"""
+
+        apt_bundle_create_script = apt_bundle_create_script.replace(
+            "__APT_BUNDLE_DEFAULT_ARCHIVE_PATH__", APT_BUNDLE_DEFAULT_ARCHIVE_PATH
+        )
+        apt_bundle_install_script = apt_bundle_install_script.replace(
+            "__APT_BUNDLE_DEFAULT_ARCHIVE_PATH__", APT_BUNDLE_DEFAULT_ARCHIVE_PATH
+        )
+
+        # Write scripts
+        apt_bundle_create_file_path: str = os.path.join(
+            CLIENT_INSTALLATION_FILES_DIRECTORY, CLIENT_APT_BUNDLE_CREATE_FILE_NAME
+        )
+        with open(apt_bundle_create_file_path, "w") as f:
+            f.write(apt_bundle_create_script)
+        os.chmod(apt_bundle_create_file_path, 0o755)
+
+        apt_bundle_install_file_path: str = os.path.join(
+            CLIENT_INSTALLATION_FILES_DIRECTORY, CLIENT_APT_BUNDLE_INSTALL_FILE_NAME
+        )
+        with open(apt_bundle_install_file_path, "w") as f:
+            f.write(apt_bundle_install_script)
+        os.chmod(apt_bundle_install_file_path, 0o755)
+
     # Copy the CA certificate crt to the client files directory.
     shutil.copy(crt_ca_file_path, CLIENT_INSTALLATION_FILES_DIRECTORY)
+
+
+def create_dummy_interface():
+    """
+    Create dummy interface (dummy0) with IP 10.254.254.1/32 using iproute2,
+    then wait until it’s actually usable for binding.
+    """
+
+    debug("create_dummy_interface() invoked")
+
+    script = textwrap.dedent(f"""
+    #!/bin/bash
+    set -Eeuo pipefail
+
+    IF="{DummyInterfaceConfig.NAME}"
+    IP="{DummyInterfaceConfig.INTERFACE_IP}"
+
+    # Create the dummy link if it doesn't exist yet
+    if ip link show "$IF" >/dev/null 2>&1; then
+        echo "[dummy] Interface $IF already exists"
+    else
+        ip link add "$IF" type dummy
+    fi
+
+    # Add the IP if it's not already there
+    if ! ip addr show "$IF" | grep -q " {DummyInterfaceConfig.INTERFACE_IP}/"; then
+        ip addr add "{DummyInterfaceConfig.INTERFACE_IP}/32" dev "$IF"
+    fi
+
+    ip link set "$IF" up
+    """).strip() + "\n"
+
+    # Run as root; if you run the Python script under sudo, this works fine.
+    completed = subprocess.run(
+        ["sudo", "bash", "-s"],
+        input=script,
+        text=True,
+        capture_output=True,
+    )
+
+    debug(f"create_dummy_interface(): returncode={completed.returncode}")
+
+    if completed.stdout:
+        print(completed.stdout, end="")
+    if completed.stderr:
+        print(completed.stderr, end="", file=sys.stderr)
+
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"Dummy interface creation failed (exit code {completed.returncode}).\n"
+            f"--- STDOUT ---\n{completed.stdout or ''}\n"
+            f"--- STDERR ---\n{completed.stderr or ''}"
+        )
+
+    global DUMMY_INTERFACE_CREATED
+    DUMMY_INTERFACE_CREATED = True
+
+    if not is_dummy_interface_available(DummyInterfaceConfig.AVAILABILITY_WAIT_SECONDS):
+        raise RuntimeError(
+            f"Dummy interface {DummyInterfaceConfig.NAME} with IP {DummyInterfaceConfig.INTERFACE_IP} "
+            f"did not become available within {DummyInterfaceConfig.AVAILABILITY_WAIT_SECONDS} seconds."
+        )
 
 
 def is_dummy_interface_available(
@@ -1411,11 +2938,10 @@ def is_dummy_interface_available(
         except OSError:
             return False
 
-
     count = 0
     while count < availability_wait_seconds:
         is_interface_created: bool = is_interface_available_for_listen(DummyInterfaceConfig.INTERFACE_IP)
-        print(f"[+] Waiting for dummy interface creation... {count + 1}/5")
+        print(f"[+] Waiting for dummy interface creation... {count + 1}/{availability_wait_seconds}")
         if is_interface_created:
             print(f"[+] Interface available: {is_interface_created}")
             return True
@@ -1453,8 +2979,16 @@ def run_servers_main(
     :return: int, 0 on success, 1 on error.
     """
 
+    debug(
+        f"run_servers_main(): listen_ip={listen_ip!r}, listen_port={listen_port}, "
+        f"localhost={localhost}, cache_dir={cache_dir}, certs_dir={certs_dir}, "
+        f"client_files_dir={client_files_dir}, client_script_options={client_script_options}, "
+        f"warm_apt_cache={warm_apt_cache}, go_offline={go_offline}"
+    )
+
     if client_script_options is None:
         client_script_options = set(CLIENT_SCRIPT_DEFAULT_FLAGS.keys())
+        debug(f"client_script_options was None, defaulting to {client_script_options}")
     try:
         server_bind_ip, client_installation_script_ip = _get_listening_and_script_ips_by_settings(
             localhost=localhost,
@@ -1473,59 +3007,25 @@ def run_servers_main(
         console.print(f"[+] ERROR: {e}", style="red", markup=False)
         return 1
 
+    debug(
+        f"_get_listening_and_script_ips_by_settings -> "
+        f"server_bind_ip={server_bind_ip}, "
+        f"client_installation_script_ip={client_installation_script_ip}"
+    )
 
     if client_installation_script_ip == DummyInterfaceConfig.INTERFACE_IP:
-        create_dummy_interface_lines = [
-            f"""
-
-# ---- Create dummy network interface -------------------------------------
-sudo tee /etc/systemd/network/10-proxy.netdev >/dev/null <<'EOF'
-[NetDev]
-Name={DummyInterfaceConfig.NAME}
-Kind=dummy
-EOF
-
-sudo tee /etc/systemd/network/20-proxy.network >/dev/null <<EOF
-[Match]
-Name={DummyInterfaceConfig.NAME}
-
-[Network]
-Address={DummyInterfaceConfig.INTERFACE_IP}/32
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl restart systemd-networkd
-"""]
-
-        # Build the script (strict mode makes the shell exit on the first error)
-        script = "set -Eeuo pipefail\n" + textwrap.dedent("\n".join(create_dummy_interface_lines)).strip() + "\n"
-
-        try:
-            completed = subprocess.run(
-                ["bash", "-s"],  # read script from stdin
-                input=script,  # the script itself (in-memory)
-                text=True,
-                capture_output=True,  # capture for error reporting
-                check=True   # raise on non-zero exit
-            )
-            # Optional: print outputs on success
-            if completed.stdout:
-                print(completed.stdout, end="")
-            if completed.stderr:
-                print(completed.stderr, end="", file=sys.stderr)
-
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(
-                f"Dummy interface creation failed (exit code {e.returncode}).\n"
-                f"--- STDOUT ---\n{e.stdout or ''}\n"
-                f"--- STDERR ---\n{e.stderr or ''}"
-            ) from e
-
-        global DUMMY_INTERFACE_CREATED
-        DUMMY_INTERFACE_CREATED = True
-
-        is_dummy_interface_available(DummyInterfaceConfig.AVAILABILITY_WAIT_SECONDS)
-
+        debug(
+            f"client_installation_script_ip == {DummyInterfaceConfig.INTERFACE_IP}, "
+            f"creating dummy interface {DummyInterfaceConfig.NAME}"
+        )
+        console.print(
+            f"[+] Creating dummy interface {DummyInterfaceConfig.NAME} "
+            f"with IP {DummyInterfaceConfig.INTERFACE_IP}",
+            style="yellow",
+            markup=False,
+        )
+        create_dummy_interface()
+        debug("create_dummy_interface() returned successfully")
 
     if cache_dir is None:
         cache_dir = CACHE_DIRECTORY
@@ -1533,7 +3033,6 @@ sudo systemctl restart systemd-networkd
         certs_dir = CERTS_DIRECTORY
 
     update_global_variables(cache_dir, certs_dir, ca_cert_file, client_files_dir)
-
 
     os.makedirs(CACHE_DIRECTORY, exist_ok=True)
     os.makedirs(CERTS_DIRECTORY, exist_ok=True)
@@ -1543,20 +3042,53 @@ sudo systemctl restart systemd-networkd
     os.makedirs(CERTS_SERVER_DIRECTORY, exist_ok=True)
     os.makedirs(CERTS_CA_DIRECTORY, exist_ok=True)
 
+    debug(
+        f"Directories created/ensured: "
+        f"CACHE_DIRECTORY={CACHE_DIRECTORY}, "
+        f"CERTS_DIRECTORY={CERTS_DIRECTORY}, "
+        f"LOGS_DIRECTORY={LOGS_DIRECTORY}, "
+        f"CLIENT_INSTALLATION_FILES_DIRECTORY={CLIENT_INSTALLATION_FILES_DIRECTORY}, "
+        f"CERTS_SERVER_DIRECTORY={CERTS_SERVER_DIRECTORY}, "
+        f"CERTS_CA_DIRECTORY={CERTS_CA_DIRECTORY}"
+    )
+
     # Creating certificates for the cache server.
+    debug("About to create CA certificates (if missing).")
     if not os.path.exists(CA_CERT_FILE):
         create_ca_certificates()
+        debug("create_ca_certificates() completed.")
+    else:
+        debug(f"CA_CERT_FILE already exists at {CA_CERT_FILE}, skipping creation.")
+
+    debug("About to create CRT/DER from PEM.")
     create_crt_and_der_from_pem()
+    debug("create_crt_and_der_from_pem() completed.")
 
-
+    debug("About to create client installation files.")
     installation_scripts_kwargs: dict = _set_installation_scripts_kwargs(client_script_options)
-    create_client_installation_files(proxy_ip=client_installation_script_ip, proxy_port=listen_port, **installation_scripts_kwargs)
+    create_client_installation_files(proxy_ip=client_installation_script_ip, proxy_port=listen_port,
+                                     **installation_scripts_kwargs)
+    debug("create_client_installation_files() completed.")
 
-    threading.Thread(
+    debug(f"Starting proxy thread on {server_bind_ip}:{listen_port}")
+    proxy_thread = threading.Thread(
         target=run_proxy_server,
         kwargs=dict(listen_ip=server_bind_ip, listen_port=listen_port),
         daemon=True
-    ).start()
+    )
+    proxy_thread.start()
+
+    # Give the proxy a short grace period to either bind successfully or
+    # crash immediately (e.g. OSError: address already in use).
+    time.sleep(0.5)
+    if not proxy_thread.is_alive():
+        console.print(
+            "[+] ERROR: proxy thread exited immediately after start. "
+            "Check proxy log for details.",
+            style="red",
+            markup=False,
+        )
+        return 1
 
     if warm_apt_cache:
         run_full_apt_update(proxy_ip=server_bind_ip, proxy_port=listen_port)
@@ -1569,18 +3101,30 @@ sudo systemctl restart systemd-networkd
         subprocess.check_call(shlex.split("sudo ip route add blackhole default"))
 
     if 'b' in client_script_options:
-        console.print("[+] To use the Docker BuildKit proxy wrapper, use this around your docker build commands (bash):", style="yellow", markup=False)
+        console.print(
+            "[+] To use the Docker BuildKit proxy wrapper, use this around your docker build commands (bash):",
+            style="yellow", markup=False)
         console.print("==============================================")
         console.print("(")
         console.print("  export PATH=\"/opt/docker-wrap:$PATH\"        # wrapper wins PATH lookup", style="yellow")
-        console.print("  ./test_build.sh                       # the bash file that includes the docker build command", style="yellow")
+        console.print("  ./test_build.sh                       # the bash file that includes the docker build command",
+                      style="yellow")
         console.print(")")
         console.print("==============================================")
 
     console.print(f"[+] Proxy server is listening on: {server_bind_ip}:{listen_port}", markup=False)
 
+    debug("Entering main keep-alive loop (while True: sleep(1)); will exit if proxy thread dies")
     while True:
         time.sleep(1)
+        if not proxy_thread.is_alive():
+            console.print(
+                "[+] ERROR: proxy thread exited unexpectedly. "
+                "Check proxy log for details.",
+                style="red",
+                markup=False,
+            )
+            return 1
 
 
 def _get_listening_and_script_ips_by_settings(
@@ -1588,9 +3132,9 @@ def _get_listening_and_script_ips_by_settings(
         listen_ip: str,
         client_script_options: set
 ) -> tuple[str, str]:
-
     if listen_ip and listen_ip != '0.0.0.0' and localhost:
-        raise InterfaceArgumentsError("[+] ERROR: No need to set [--localhost] if you are explicitly setting [--listen-ip]. You can do this only if [--listen-ip] is '0.0.0.0'")
+        raise InterfaceArgumentsError(
+            "[+] ERROR: No need to set [--localhost] if you are explicitly setting [--listen-ip]. You can do this only if [--listen-ip] is '0.0.0.0'")
 
     note_message: str = (
         "and if there is a 'b' in [--client-script-options] (by default there is); "
@@ -1601,14 +3145,14 @@ def _get_listening_and_script_ips_by_settings(
     )
 
     if listen_ip and listen_ip.startswith('127.') and 'b' in client_script_options:
-        console.print(f"[+] NOTE: If you are using [--listen-ip] that starts with '127.' (loopback address), {note_message}",
-                      style="yellow", markup=False)
+        console.print(
+            f"[+] NOTE: If you are using [--listen-ip] that starts with '127.' (loopback address), {note_message}",
+            style="yellow", markup=False)
 
     if localhost and 'b' in client_script_options:
         console.print(
             f"[+] NOTE: If you are using [--localhost] the proxy listening will be assigned to '127.0.0.1', {note_message}",
             style="yellow", markup=False)
-
 
     if not listen_ip and localhost:
         return DummyInterfaceConfig.INTERFACE_IP, DummyInterfaceConfig.INTERFACE_IP
@@ -1789,7 +3333,8 @@ def _make_arg_parser():
         '-cfd', '--client-files-dir', type=str, default=ParserDefaults.CLIENT_FILES_DIR,
         help="Full path to directory where ubuntu client installation bash scripts and required files will be stored. Default: <working directory>/client_files")
     parser.add_argument(
-        '-cso', '--client-script-options', metavar='LETTERS', type=char_flags, default=ParserDefaults.CLIENT_SCRIPT_OPTIONS,
+        '-cso', '--client-script-options', metavar='LETTERS', type=char_flags,
+        default=ParserDefaults.CLIENT_SCRIPT_OPTIONS,
         help="Options:\n"
              "" + "\n".join(f"{k}={v}" for k, v in CLIENT_SCRIPT_DEFAULT_FLAGS.items()) +
              "\n\n"
@@ -1807,6 +3352,7 @@ def _make_arg_parser():
              "This is useful if you want to use the APT cache and have it ready for use right after the proxy setup.\n"
              "If not set, you will need to run these commands manually after the proxy setup.\n"
     )
+
     parser.add_argument(
         '-go', '--go-offline', action='store_true',
         help="If set, the command will be executed:\n"
@@ -1826,12 +3372,20 @@ if __name__ == '__main__':
     signal.signal(signal.SIGINT, _graceful_shutdown)
     arg_parser = _make_arg_parser()
     exec_args = arg_parser.parse_args()
+    debug(f"offline_setup_cacher starting with args: {exec_args}")
 
     try:
         exit_result: int = run_servers_main(**vars(exec_args))
     except KeyboardInterrupt:
+        debug("KeyboardInterrupt caught in main; calling _exit_clean()")
         _exit_clean()
-    finally:
         exit_result = 0
+    except Exception:
+        # Any unhandled exception ends up here and is logged to stderr/stdout.
+        print("[FATAL] Unhandled exception in offline_setup_cacher:", file=sys.stderr, flush=True)
+        traceback.print_exc()  # full stack trace into the log
+        exit_result = 1
+
+    debug(f"offline_setup_cacher exiting with code {exit_result}")
 
     sys.exit(exit_result)
